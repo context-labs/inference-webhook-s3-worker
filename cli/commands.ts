@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 
 import { SAFE_KEY_PREFIX, type WorkerStatus } from "../src/index.ts";
-import { CliError, cli, code, type Output } from "./output.ts";
+import { CliError, cli, code, exec, install, type Output } from "./output.ts";
 import type { Prompter } from "./prompt.ts";
 import { probeS3Write, type S3Keys } from "./s3.ts";
 import { type Deployment, type LocalSecrets, type S3Settings, type StateStore, workerNameError } from "./state.ts";
@@ -57,14 +57,14 @@ export async function setup(deps: Deps, nameArgument: string | undefined, option
   const { out, prompt } = deps;
   const startedAt = deps.now();
   const earlyNameError = nameArgument === undefined ? null : workerNameError(nameArgument);
-  if (earlyNameError) throw new CliError(earlyNameError, `Example: ${cli(`setup ${DEFAULT_NAME}`)}`);
+  if (earlyNameError) throw new CliError(earlyNameError, `Example: ${cli(`setup ${DEFAULT_NAME}`)}`, 2);
   out.heading("1/5  Check tools");
   const accountId = await checkTools(deps, options.accountId);
 
   out.heading("2/5  Name the Worker");
   const name = nameArgument ?? (await ask(deps, "Worker name (unique in your Cloudflare account)", { default: DEFAULT_NAME }, "the name argument"));
   const nameError = workerNameError(name);
-  if (nameError) throw new CliError(nameError, `Example: ${cli(`setup ${DEFAULT_NAME}`)}`);
+  if (nameError) throw new CliError(nameError, `Example: ${cli(`setup ${DEFAULT_NAME}`)}`, 2);
   if (await deps.store.read(name)) {
     throw new CliError(
       `${name} is already set up from this folder.`,
@@ -96,7 +96,7 @@ export async function setup(deps: Deps, nameArgument: string | undefined, option
     out.info(`    2. Deploy Worker ${name} to https://${name}.<your-subdomain>.workers.dev`);
     out.info(`    3. Store ${secretNames.length} encrypted Worker secrets: ${secretNames.join(", ")}`);
     out.info(`    4. Check the deployed Worker, then walk you through registering the webhook URL on inference.net`);
-    out.info(`\n  Run it for real: ${cli(`setup ${name}`)}`);
+    out.next(cli(`setup ${name}`));
     const result = { ok: true, dryRun: true, name, accountId, s3, secrets: secretNames };
     out.result(result);
     return result;
@@ -126,27 +126,11 @@ export async function setup(deps: Deps, nameArgument: string | undefined, option
   out.ok("Secrets stored. Your S3 keys live only in your Cloudflare account.");
   out.step("Waiting for the Worker to answer (a new workers.dev URL can take a minute)");
   const status = await waitForWorker(deps, deployment, secrets);
-  checkProbe(out, status);
+  checkProbe(out, name, status);
 
   out.heading("5/5  Register the webhook on inference.net");
   const webhookUrl = `${deployment.url}/${secrets.pathSecret}`;
-  if (!secrets.webhookId) {
-    out.info("  1. In the inference.net dashboard, open Settings → Integrations → Create Webhook.");
-    out.info(`  2. Paste this URL:\n\n     ${code(webhookUrl)}\n`);
-    out.info("  3. Save it, and copy the webhook identifier it shows.");
-    const webhookId = prompt ? (await prompt.input("Webhook identifier (leave empty to add it later)")).trim() : "";
-    if (webhookId) {
-      await setWebhookId(deps, deployment, secrets, webhookId);
-    } else {
-      out.warn(
-        "The Worker rejects deliveries until it knows the webhook identifier.",
-        `Run ${cli(`config ${name} --webhook-id <identifier>`)} after you create the webhook.`,
-      );
-    }
-  } else {
-    out.ok(`Webhook identifier ${secrets.webhookId} stored. Register this URL on it: ${code(webhookUrl)}`);
-  }
-
+  await registerWebhook(deps, deployment, secrets, webhookUrl);
   let testDelivery = false;
   if (secrets.webhookId && prompt && (await prompt.confirm("Wait here while you click Test on the webhook in the dashboard?", true))) {
     testDelivery = await waitForTestDelivery(deps, deployment, secrets, startedAt);
@@ -155,7 +139,8 @@ export async function setup(deps: Deps, nameArgument: string | undefined, option
   out.heading(`Done. ${name} is live.`);
   out.info(`  Webhook URL:   ${code(webhookUrl)}`);
   out.info(`  Objects go to: ${s3.bucket}/${s3.keyPrefix}{groups,generations}/<id>.json`);
-  out.info(`  Next:          ${cli(`status ${name}`)}   ${cli(`test ${name}`)}   ${cli(`logs ${name}`)}`);
+  if (secrets.webhookId) out.next(cli(`status ${name}`), cli(`test ${name}`), cli(`logs ${name}`));
+  else out.next(cli(`config ${name} --webhook-id <identifier>`));
   const result = { ok: true, name, accountId, url: deployment.url, webhookUrl, webhookIdSet: Boolean(secrets.webhookId), testDelivery, s3 };
   out.result(result);
   return result;
@@ -242,7 +227,9 @@ export async function status(deps: Deps, name: string) {
   }
 
   const ok = checks.every((check) => check.ok || check.check === "deliveries" || check.check === "last-error");
-  out.info(ok ? `\n${name} is healthy.` : `\n${name} needs attention.`);
+  out.info(ok ? `\n${name} is healthy.` : `\n${name} needs attention. Apply the fixes above.`);
+  if (ok) out.next(cli(`test ${name}`), cli(`logs ${name}`));
+  else out.next(cli(`status ${name}`));
   const result = { ok, name, url: deployment.url, checks, worker: workerStatus };
   out.result(result);
   return result;
@@ -282,6 +269,7 @@ export async function test(deps: Deps, name: string) {
     throw new CliError(`The Worker answered HTTP ${response.status}: ${body}`, errorFix(name, response.status));
   }
   out.ok(`S3 accepted ${deployment.s3.bucket}/${body} (the Worker answers 200 only after S3 confirms the write)`);
+  out.next(cli(`status ${name}`), cli(`logs ${name}`));
   const result = { ok: true, name, bucket: deployment.s3.bucket, key: body };
   out.result(result);
   return result;
@@ -354,7 +342,8 @@ export async function config(deps: Deps, name: string, options: ConfigOptions) {
     out.info(`  Key prefix:    ${deployment.s3.keyPrefix || "(none)"}`);
     out.info(`  Endpoint:      ${deployment.s3.endpoint ?? "AWS S3"}`);
     out.info(`  State files:   ${deps.store.statePath(name)}, ${deps.store.secretsPath(name)}`);
-    out.info(`\n  Change settings with flags, for example ${cli(`config ${name} --prefix embeddings/`)}. See ${cli("config --help")}.`);
+    out.info(`\n  Change settings with flags, for example ${cli(`config ${name} --prefix embeddings/`)}.`);
+    out.next(cli(`status ${name}`), cli("config --help"));
     const result = { ok: true, ...deployment, webhookUrl: webhookUrl(), webhookId: secrets.webhookId };
     out.result(result);
     return result;
@@ -375,7 +364,8 @@ export async function config(deps: Deps, name: string, options: ConfigOptions) {
   }
   out.step("Checking the Worker with the new settings");
   const workerStatus = await waitForWorker(deps, deployment, secrets);
-  checkProbe(out, workerStatus);
+  checkProbe(out, name, workerStatus);
+  out.next(cli(`test ${name}`));
   const result = { ok: true, name, changed: Object.keys(changes), webhookUrl: webhookUrl() };
   out.result(result);
   return result;
@@ -387,7 +377,8 @@ export async function update(deps: Deps, name: string) {
   deps.out.heading(`Update ${name}`);
   const updated = await deploy(deps, deployment);
   deps.out.step("Checking the Worker");
-  checkProbe(deps.out, await waitForWorker(deps, updated, secrets));
+  checkProbe(deps.out, name, await waitForWorker(deps, updated, secrets));
+  deps.out.next(cli(`status ${name}`));
   const result = { ok: true, name, url: updated.url };
   deps.out.result(result);
   return result;
@@ -397,13 +388,16 @@ export async function update(deps: Deps, name: string) {
 export async function list(deps: Deps) {
   const deployments = await deps.store.list();
   if (deployments.length === 0) {
-    deps.out.info(`No Workers set up from this folder yet. Run ${cli("setup")}.`);
+    deps.out.info("No Workers set up from this folder yet.");
+    deps.out.next(cli("setup"));
   }
   for (const deployment of deployments) {
     deps.out.info(
       `${code(deployment.name.padEnd(28))} ${(deployment.url ?? "(not deployed)").padEnd(56)} ${deployment.s3.bucket}/${deployment.s3.keyPrefix}`,
     );
   }
+  const first = deployments[0];
+  if (first) deps.out.next(cli(`status ${first.name}`));
   const result = deployments.map(({ name, url, accountId, s3, updatedAt }) => ({ name, url, accountId, s3, updatedAt }));
   deps.out.result(result);
   return result;
@@ -414,9 +408,9 @@ export async function destroy(deps: Deps, name: string, options: { yes?: boolean
   const { out, prompt } = deps;
   const { deployment } = await load(deps, name);
   if (!options.yes) {
-    if (!prompt) throw new CliError(`destroy needs confirmation.`, `Run it in a terminal, or add ${code("--yes")}.`);
+    if (!prompt) throw new CliError("destroy needs confirmation.", `Run it in a terminal, or run ${cli(`destroy ${name} --yes`)}.`, 2);
     const typed = await prompt.input(`This deletes Worker ${name}. Deliveries to it will fail. Type the name to confirm`);
-    if (typed.trim() !== name) throw new CliError("The name did not match. Nothing was deleted.");
+    if (typed.trim() !== name) throw new CliError("The name did not match. Nothing was deleted.", `Run ${cli(`destroy ${name}`)} again and type ${name} exactly.`);
   }
   out.heading(`Destroy ${name}`);
   out.step("Deleting the Worker");
@@ -428,6 +422,7 @@ export async function destroy(deps: Deps, name: string, options: { yes?: boolean
   await deps.store.remove(name);
   out.ok("Local state removed");
   out.info(`\nObjects in ${deployment.s3.bucket} were not touched. Delete the webhook in the inference.net dashboard too.`);
+  out.next(cli("list"));
   const result = { ok: true, name, worker };
   out.result(result);
   return result;
@@ -442,17 +437,17 @@ async function checkTools(deps: Deps, accountOption: string | undefined): Promis
   out.ok(`Node.js ${deps.nodeVersion}`);
 
   const version = await deps.wrangler(["--version"]);
-  if (version.code !== 0) throw new CliError("wrangler does not run.", `Run ${code("npm install")} in this folder.`);
+  if (version.code !== 0) throw new CliError("wrangler does not run.", `Run ${install()} in this folder.`);
   out.ok(`wrangler ${version.stdout.trim().split(/\s+/).pop()}`);
 
   let account = await whoami(deps.wrangler);
   if (!account.loggedIn) {
     if (!prompt || !(await prompt.confirm("You are not logged in to Cloudflare. Log in now?", true))) {
-      throw new CliError("Not logged in to Cloudflare.", `Run ${code("npx wrangler login")}, or set CLOUDFLARE_API_TOKEN.`);
+      throw new CliError("Not logged in to Cloudflare.", `Run ${exec("wrangler login")}, or set CLOUDFLARE_API_TOKEN.`);
     }
     await deps.wrangler(["login"], { interactive: true });
     account = await whoami(deps.wrangler);
-    if (!account.loggedIn) throw new CliError("Cloudflare login did not finish.", `Run ${code("npx wrangler login")}.`);
+    if (!account.loggedIn) throw new CliError("Cloudflare login did not finish.", `Run ${exec("wrangler login")}.`);
   }
 
   const wanted = accountOption ?? deps.env.CLOUDFLARE_ACCOUNT_ID;
@@ -469,6 +464,7 @@ async function checkTools(deps: Deps, accountOption: string | undefined): Promis
     throw new CliError(
       wanted ? `Cloudflare account ${wanted} is not available to this login.` : "Pick a Cloudflare account.",
       `Pass ${code("--account-id <id>")}. Your accounts: ${accounts.map(({ id, name }) => `${name} (${id})`).join(", ") || "none"}.`,
+      2,
     );
   }
   out.ok(`Logged in to Cloudflare account ${chosen.name} (${chosen.id})`);
@@ -523,7 +519,7 @@ async function askS3Keys(deps: Deps, options: { accessKeyId?: string; secretAcce
 
 function normalizePrefix(out: Output, prefix: string): string {
   if (!SAFE_KEY_PREFIX.test(prefix)) {
-    throw new CliError(`Key prefix "${prefix}" has a character that is not allowed.`, "Use only A-Z a-z 0-9 / _ . -");
+    throw new CliError(`Key prefix "${prefix}" has a character that is not allowed.`, "Use only A-Z a-z 0-9 / _ . -", 2);
   }
   if (prefix && !prefix.endsWith("/")) {
     out.info(`    Using key prefix "${prefix}/" so keys look like ${prefix}/groups/<id>.json.`);
@@ -546,6 +542,7 @@ function missing(flag: string): never {
   throw new CliError(
     `Missing ${flag}. The CLI cannot ask for it with --json, with --yes, or without a terminal.`,
     `Pass ${code(flag)}, or run the command in a terminal without --json and --yes.`,
+    2,
   );
 }
 
@@ -585,6 +582,30 @@ function workerSecrets(s3: S3Settings, keys: S3Keys, secrets: LocalSecrets): Rec
   return Object.fromEntries(Object.entries(values).filter((entry): entry is [string, string] => entry[1] !== null));
 }
 
+/**
+ * Gets the Worker a webhook identifier: the one from `--webhook-id`, or one the
+ * user pastes after creating the webhook in the dashboard. Updates `secrets`.
+ */
+async function registerWebhook(deps: Deps, deployment: Deployment, secrets: LocalSecrets, webhookUrl: string): Promise<void> {
+  const { out, prompt } = deps;
+  if (secrets.webhookId) {
+    out.ok(`Webhook identifier ${secrets.webhookId} stored. Register this URL on it: ${code(webhookUrl)}`);
+    return;
+  }
+  out.info("  1. In the inference.net dashboard, open Settings → Integrations → Create Webhook.");
+  out.info(`  2. Paste this URL:\n\n     ${code(webhookUrl)}\n`);
+  out.info("  3. Save it, and copy the webhook identifier it shows.");
+  const webhookId = prompt ? (await prompt.input("Webhook identifier (leave empty to add it later)")).trim() : "";
+  if (webhookId) {
+    await setWebhookId(deps, deployment, secrets, webhookId);
+    return;
+  }
+  out.warn(
+    "The Worker rejects deliveries until it knows the webhook identifier.",
+    `Run ${cli(`config ${deployment.name} --webhook-id <identifier>`)} after you create the webhook.`,
+  );
+}
+
 async function setWebhookId(deps: Deps, deployment: Deployment, secrets: LocalSecrets, webhookId: string): Promise<void> {
   deps.out.step("Storing the webhook identifier");
   await putSecrets(deps.wrangler, deployment.name, { INFERENCE_WEBHOOK_ID: webhookId }, deployment.accountId);
@@ -620,11 +641,11 @@ async function waitForWorker(deps: Deps, deployment: Deployment, secrets: LocalS
   }
 }
 
-function checkProbe(out: Output, workerStatus: WorkerStatus): void {
+function checkProbe(out: Output, name: string, workerStatus: WorkerStatus): void {
   if (!workerStatus.probe?.ok) {
     throw new CliError(
       `The Worker answers, but its S3 write failed: ${workerStatus.probe?.message ?? "S3 settings missing"}`,
-      `Run ${cli("status <name>")} for details.`,
+      `Run ${cli(`status ${name}`)} for details.`,
     );
   }
   out.ok(`The deployed Worker wrote ${workerStatus.probe.key}`);

@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -5,7 +6,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as commands from "../cli/commands";
-import { CliError, Output } from "../cli/output";
+import { CliError, command, detectPackageManager, Output } from "../cli/output";
 import type { Prompter } from "../cli/prompt";
 import { probeS3Write } from "../cli/s3";
 import { type Deployment, StateStore, workerNameError } from "../cli/state";
@@ -419,5 +420,88 @@ describe("setup --dry-run", () => {
     expect(result).toMatchObject({ ok: true, dryRun: true });
     expect(calls.map(({ args }) => args[0])).toEqual(["--version", "whoami", "deployments"]);
     expect(await store.read("my-results")).toBeNull();
+  });
+});
+
+describe("detectPackageManager", () => {
+  it.each([
+    ["npm/11.11.0 node/v24.14.1 linux x64 workspaces/false", "npm"],
+    ["pnpm/9.9.0 npm/? node/v24.14.1 linux x64", "pnpm"],
+    ["yarn/1.22.22 npm/? node/v24.14.1 linux x64", "yarn"],
+    ["yarn/4.18.1 npm/? node/v24.14.1 linux x64", "yarn"],
+    ["bun/1.4.4 npm/? node/v26.3.0 linux x64", "bun"],
+    [undefined, "npm"],
+    ["", "npm"],
+    ["deno/2.0.0", "npm"],
+  ] as const)("%s → %s", (userAgent, expected) => {
+    expect(detectPackageManager(userAgent)).toBe(expected);
+  });
+
+  it("prints commands in the form each package manager runs them", () => {
+    expect(command("status x --json", "npm")).toBe("npm run cli -- status x --json");
+    expect(command("status x --json", "pnpm")).toBe("pnpm cli status x --json");
+    expect(command("status x --json", "yarn")).toBe("yarn cli status x --json");
+    expect(command("status x --json", "bun")).toBe("bun run cli status x --json");
+  });
+});
+
+describe("CLI process", () => {
+  /** Runs cli/main.ts like a package manager would, with no color settings inherited from the test runner. */
+  function runCli(args: string[], env: Record<string, string> = {}) {
+    const { FORCE_COLOR: _force, NO_COLOR: _no, npm_config_user_agent: _agent, ...base } = process.env;
+    const result = spawnSync(process.execPath, [join(import.meta.dirname, "../cli/main.ts"), ...args], {
+      env: { ...base, ...env },
+      encoding: "utf8",
+    });
+    return { code: result.status, output: result.stdout + result.stderr };
+  }
+  const MISSING = "no-such-worker-for-tests";
+
+  it("shows examples and exit codes in root help, in the launching package manager's form", () => {
+    const { code, output } = runCli(["--help"], { npm_config_user_agent: "pnpm/9.9.0 npm/? node/v24.14.1" });
+    expect(code).toBe(0);
+    expect(output).toContain("pnpm cli setup");
+    expect(output).not.toContain("npm run cli");
+    expect(output).toMatch(/Exit codes:[\s\S]*2 +usage error/);
+  });
+
+  it.each(["setup", "status", "test", "logs", "config", "update", "list", "destroy"])("shows examples in %s --help", (name) => {
+    const { code, output } = runCli([name, "--help"]);
+    expect(code).toBe(0);
+    expect(output).toContain("Examples:");
+    expect(output).toContain(`npm run cli -- ${name}`);
+  });
+
+  it.each([
+    ["no command (prints help)", [], 0],
+    ["an unknown command", ["bogus"], 2],
+    ["an unknown flag", ["list", "--bogus"], 2],
+    ["a missing argument", ["status"], 2],
+    ["an invalid Worker name", ["setup", "Not_Valid", "--yes"], 2],
+    ["a Worker that is not set up", ["status", MISSING], 1],
+  ] as const)("exits with the documented code for %s", (_case, args, expected) => {
+    expect(runCli([...args]).code).toBe(expected);
+  });
+
+  it("names the fix on an error", () => {
+    expect(runCli(["status", MISSING]).output).toMatch(/Fix: Run npm run cli -- list/);
+  });
+
+  it("uses color only when allowed", () => {
+    const escape = /\u001b\[/;
+    expect(runCli(["status", MISSING], { FORCE_COLOR: "1" }).output).toMatch(escape);
+    expect(runCli(["status", MISSING, "--no-color"], { FORCE_COLOR: "1" }).output).not.toMatch(escape);
+    expect(runCli(["status", MISSING], { NO_COLOR: "1" }).output).not.toMatch(escape);
+    expect(runCli(["status", MISSING]).output).not.toMatch(escape);
+  });
+
+  it("prints only JSON on stdout with --json, errors included", () => {
+    const result = spawnSync(process.execPath, [join(import.meta.dirname, "../cli/main.ts"), "status", MISSING, "--json"], {
+      env: { ...process.env, FORCE_COLOR: "1" },
+      encoding: "utf8",
+    });
+    expect(result.stdout).not.toMatch(/\u001b\[/);
+    expect(result.status).toBe(1);
+    expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, fix: expect.stringContaining("list") });
   });
 });

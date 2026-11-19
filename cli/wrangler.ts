@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 
-import { CliError, code } from "./output.ts";
+import { CliError, exec, install } from "./output.ts";
 
 export interface WranglerResult {
   code: number;
@@ -40,7 +40,7 @@ export function createWrangler(repoRoot: string): Wrangler {
       child.stdout?.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
       child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
       child.on("error", (error) =>
-        reject(new CliError(`Could not run wrangler: ${error.message}`, `Run ${code("npm install")} in the repo first.`)),
+        reject(new CliError(`Could not run wrangler: ${error.message}`, `Run ${install()} in this folder first.`)),
       );
       child.on("close", (exitCode) => resolve({ code: exitCode ?? 1, stdout, stderr }));
       child.stdin?.end(options.input ?? "");
@@ -81,10 +81,14 @@ export async function createStatusNamespace(wrangler: Wrangler, title: string, a
 export async function deployWorker(wrangler: Wrangler, configPath: string, accountId: string): Promise<string> {
   const result = await wrangler(["deploy", "--config", configPath], { accountId });
   if (result.code !== 0) {
-    const fix = /workers\.dev subdomain/i.test(result.stderr)
-      ? "Open Workers & Pages in the Cloudflare dashboard once to create your workers.dev subdomain, then run this command again."
-      : null;
-    throw wranglerError("wrangler deploy failed", result, fix);
+    if (/workers\.dev subdomain/i.test(result.stderr)) {
+      throw wranglerError(
+        "wrangler deploy failed",
+        result,
+        "Open Workers & Pages in the Cloudflare dashboard once to create your workers.dev subdomain, then run this command again.",
+      );
+    }
+    throw wranglerError("wrangler deploy failed", result);
   }
   const url = /https:\/\/[a-z0-9.-]+\.workers\.dev/.exec(result.stdout)?.[0];
   if (!url) {
@@ -123,7 +127,11 @@ export async function deleteNamespace(wrangler: Wrangler, namespaceId: string, a
   }
 }
 
-function wranglerError(message: string, result: WranglerResult, fix: string | null = null): CliError {
+function wranglerError(
+  message: string,
+  result: WranglerResult,
+  fix = `Check your Cloudflare login with ${exec("wrangler whoami")}, then run the command again.`,
+): CliError {
   const detail = (result.stderr || result.stdout)
     .split("\n")
     .map((line) => line.trim())
