@@ -12,9 +12,16 @@ You need Node.js 22.18 or later, a Cloudflare account, and an S3 bucket with an 
 
 ```sh
 git clone https://github.com/context-labs/inference-webhook-s3-worker.git && cd inference-webhook-s3-worker
-npm install
-npm run cli -- setup
 ```
+
+Then install and start setup with your package manager:
+
+| Package manager | Command |
+| --- | --- |
+| npm | `npm install && npm run cli -- setup` |
+| pnpm | `pnpm install && pnpm cli setup` |
+| Yarn | `yarn install && yarn cli setup` |
+| Bun | `bun install && bun run cli setup` |
 
 `setup` asks for each value and checks it before it moves on:
 
@@ -27,6 +34,21 @@ npm run cli -- setup
 Then send requests with that webhook identifier (see [Example client](#example-client)).
 
 To check everything first without creating anything in Cloudflare, run `npm run cli -- setup <name> --dry-run`.
+
+### Package managers
+
+The CLI prints every next command in the form of the package manager you started it with. This README uses npm. With another package manager, replace the npm part:
+
+| npm | pnpm | Yarn | Bun |
+| --- | --- | --- | --- |
+| `npm install`, `npm ci` | `pnpm install` | `yarn install` | `bun install` |
+| `npm run cli -- <command>` | `pnpm cli <command>` | `yarn cli <command>` | `bun run cli <command>` |
+| `npm test`, `npm run <script>` | `pnpm test`, `pnpm <script>` | `yarn test`, `yarn <script>` | `bun run test`, `bun run <script>` |
+| `npx wrangler <args>` | `pnpm exec wrangler <args>` | `yarn wrangler <args>` | `bunx wrangler <args>` |
+
+`node cli/main.ts <command>` works after any of them. Use `bun run test`, not `bun test`: `bun test` starts Bun's own test runner.
+
+`package-lock.json` is the only lockfile in the repo, and `npm ci` installs exactly what CI tested. pnpm, Yarn, and Bun do not read it (Bun imports it on the first install), so they resolve dependencies again within the exact versions in `package.json`; CI installs and tests with all four every week. The repo ignores their lockfiles, so `git pull` never conflicts with them. `.yarnrc.yml` makes Yarn 2+ install into `node_modules`, and `.yarnrc` stops Yarn 1 from rejecting a transitive dependency that asks for a newer Node.js patch release.
 
 ## Manage the Worker
 
@@ -42,7 +64,14 @@ Every command takes the Worker name you chose in setup.
 | `npm run cli -- list` | Lists the Workers set up from this folder. |
 | `npm run cli -- destroy <name>` | Deletes the Worker and its status store, after you type its name. Objects in S3 stay. |
 
-`npx webhook-s3 <command>` works too. Add `--help` to any command for its flags.
+Add `--help` to any command for its flags, their defaults, and examples. Every command ends with the command to run next, and every error ends with a fix. Colors turn off with `--no-color`, with `NO_COLOR=1`, and when the output is not a terminal.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Success. |
+| `1` | A check failed (`status`), or the command failed. The message says how to fix it. |
+| `2` | Usage error: an unknown command or flag, or a missing or invalid value. |
+| `130` | You pressed Ctrl+C at a question. |
 
 Example `status` output:
 
@@ -55,6 +84,8 @@ Status of my-embeddings
   ✔ Last delivery 42s ago (2026-11-19T22:43:10.854Z): slow-group.completed → embeddings/groups/grp_abc.json
 
 my-embeddings is healthy.
+
+Next: npm run cli -- test my-embeddings   npm run cli -- logs my-embeddings
 ```
 
 ### Scripts and CI
@@ -62,11 +93,12 @@ my-embeddings is healthy.
 - `--json` prints one JSON result on stdout (including errors, as `{"ok": false, "error", "fix"}`) and never asks questions.
 - `--yes` never asks questions. A missing value fails with the flag to pass.
 - `setup` reads every value from flags: `--storage aws|r2|other`, `--bucket`, `--region`, `--prefix`, `--endpoint`, `--webhook-id`, `--account-id`. Pass S3 keys as `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, not as flags, so they stay out of shell history.
+- Run `node cli/main.ts` in scripts. npm, pnpm, and Yarn 1 print a banner on stdout before a script's output, which breaks `--json` parsing.
 
 ```sh
 AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
-  npm run cli -- setup my-embeddings --yes --bucket my-embeddings --region us-east-1 --prefix embeddings/
-npm run cli -- status my-embeddings --json | jq .ok
+  node cli/main.ts setup my-embeddings --yes --bucket my-embeddings --region us-east-1 --prefix embeddings/
+node cli/main.ts status my-embeddings --json | jq .ok
 ```
 
 ### Local state
