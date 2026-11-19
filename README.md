@@ -57,14 +57,14 @@ Set every value as a Worker secret: in `.env` with `wrangler deploy --secrets-fi
 Each object is the webhook body exactly as inference.net sent it. The [webhook docs](https://inference.net/docs/api/async/webhooks/) describe the payloads. For a group, each entry in `data.generations` holds one request and its result:
 
 - `state` is `Success` or `Failed`. Resubmit failed requests.
-- `request.metadata` is the metadata you sent with the request, for example a `custom_id`.
-- `request.input` has the image URL replaced by `REDACTED`, so the object does not store the image again.
-- `response.data[].embedding` is the vector.
+- `request.metadata` is the metadata you sent with the request, for example `custom_ids`.
+- `request.input` has every image URL replaced by `REDACTED`, so the object does not store the images again.
+- `response.data[i].embedding` is the vector of input image `i` (`response.data[i].index` is `i`).
 
-To list the vectors in a group object:
+To list the vectors in a group object, one line per image:
 
 ```sh
-jq -c '.data.generations[] | {custom_id: .request.metadata.custom_id, state, embedding: .response.data[0].embedding}' grp_abc.json
+jq -c '.data.generations[] | .request.metadata.custom_ids as $ids | .state as $state | .response.data[]? | {custom_id: $ids[.index], state: $state, embedding}' grp_abc.json
 ```
 
 ## Responses and retries
@@ -109,32 +109,30 @@ Give the access key write access to the prefix only:
 
 ## Cost
 
-Approximate list prices for one billion 768-dimension embeddings, sent in groups of 50 (20 million webhooks):
+Approximate list prices for one billion 768-dimension embeddings, sent in groups of 500 images (2 million webhooks):
 
 | Item | Cost |
 | --- | --- |
-| Cloudflare Workers Paid: $5/month with 10 million requests, then $0.30 per million | about $8 |
-| S3 `PUT` requests: $0.005 per 1,000 | about $100 |
+| Cloudflare Workers Paid: $5/month with 10 million requests, then $0.30 per million | about $5 |
+| S3 `PUT` requests: $0.005 per 1,000 | about $10 |
 | S3 Standard storage: a vector is 10–16 KB as JSON, so 10–16 TB | about $230–370 per month |
 
-Send groups of 50, not one request per image. One webhook per image costs 50 times more in Worker requests and S3 `PUT`s (about $5,000 more per billion images). Cloudflare R2 charges $4.50 per million writes and $0.015 per GB-month, with no egress fees.
+Send 50 images per request and 10 requests per group, not one request per image. One webhook per image costs 500 times more in Worker requests and S3 `PUT`s (about $5,000 more per billion images). Cloudflare R2 charges $4.50 per million writes and $0.015 per GB-month, with no egress fees.
 
 ## Example client
 
-[`examples/submit-embeddings.ts`](examples/submit-embeddings.ts) sends every JPEG in a folder to `/v1/async/group/embeddings` in groups of 50, as base64 data URLs. Each request carries `metadata.custom_id` set to the file path, so you can match each vector to its image. The script prints one line per group with the `groupId` and its file paths.
+[`examples/submit-embeddings.ts`](examples/submit-embeddings.ts) sends every JPEG in a folder to `/v1/async/group/embeddings` as base64 data URLs: 50 images per request, 10 requests per group. Each request carries `metadata.custom_ids`, the file paths of its images in input order, so `response.data[i]` is the vector of `custom_ids[i]`. The script prints one line per group with the `groupId` and its file paths.
 
-Each request holds one image as a user message with one `image_url` part. The URL must be a base64 data URL (`image/png`, `image/jpeg`, `image/gif` or `image/webp`) of at most 524,288 characters, which is about 384 KB of image:
+`input` is a list of 1–50 images. Each image is one user message with one `image_url` part. The URL must be a base64 data URL (`image/png`, `image/jpeg`, `image/gif` or `image/webp`) of at most 524,288 characters, which is about 384 KB of image. The whole group body must stay under 32 MiB.
 
 ```json
 {
   "model": "google/siglip2-base-patch16-naflex",
   "input": [
-    {
-      "role": "user",
-      "content": [{ "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,/9j/4AAQ..." } }]
-    }
+    [{ "role": "user", "content": [{ "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,/9j/4AAQ..." } }] }],
+    [{ "role": "user", "content": [{ "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,/9j/4BBQ..." } }] }]
   ],
-  "metadata": { "custom_id": "cats/0001.jpg" }
+  "metadata": { "custom_ids": ["cats/0001.jpg", "cats/0002.jpg"] }
 }
 ```
 

@@ -1,7 +1,9 @@
 /**
- * Submits every JPEG under a folder as async image-embedding groups of up to
- * 50 requests. Each request sets `metadata.custom_id` to the file path
- * relative to the folder, so you can match each vector in S3 to its image.
+ * Submits every JPEG under a folder as async image-embedding groups. Each
+ * request embeds up to 50 images; each group holds up to 10 requests (500
+ * images). Each request sets `metadata.custom_ids` to the file paths of its
+ * images, relative to the folder, in input order: `response.data[i]` is the
+ * vector of `custom_ids[i]`.
  *
  * Prints one JSON line per group: {"groupId": "...", "customIds": [...]}.
  * The Worker stores that group at `<S3_KEY_PREFIX>groups/<groupId>.json`.
@@ -15,7 +17,10 @@ import { join } from "node:path";
 
 const API_URL = "https://api.inference.net/v1/async/group/embeddings";
 const MODEL = "google/siglip2-base-patch16-naflex";
-const GROUP_SIZE = 50;
+const IMAGES_PER_REQUEST = 50;
+// 500 images of ~27 KB are ~18 MB of base64, under the 32 MiB body cap.
+const REQUESTS_PER_GROUP = 10;
+const IMAGES_PER_GROUP = IMAGES_PER_REQUEST * REQUESTS_PER_GROUP;
 const CONCURRENCY = 4;
 const MAX_ATTEMPTS = 5;
 
@@ -28,10 +33,7 @@ if (!folder || !apiKey || !webhookId) {
 }
 
 const files = (await readdir(folder, { recursive: true })).filter((file) => /\.jpe?g$/i.test(file)).sort();
-const groups: string[][] = [];
-for (let start = 0; start < files.length; start += GROUP_SIZE) {
-  groups.push(files.slice(start, start + GROUP_SIZE));
-}
+const groups = chunk(files, IMAGES_PER_GROUP);
 
 let nextGroup = 0;
 async function submitLoop(): Promise<void> {
@@ -45,23 +47,33 @@ async function submitLoop(): Promise<void> {
 await Promise.all(Array.from({ length: CONCURRENCY }, submitLoop));
 console.error(`Submitted ${files.length} images in ${groups.length} groups`);
 
+function chunk<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let start = 0; start < items.length; start += size) {
+    chunks.push(items.slice(start, start + size));
+  }
+  return chunks;
+}
+
 async function submitGroup(paths: string[]): Promise<void> {
   const requests = await Promise.all(
-    paths.map(async (path) => ({
+    chunk(paths, IMAGES_PER_REQUEST).map(async (requestPaths) => ({
       model: MODEL,
-      // One image per request: a user message with one `image_url` part.
-      input: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "image_url",
-              image_url: { url: `data:image/jpeg;base64,${(await readFile(join(folder, path))).toString("base64")}` },
-            },
-          ],
-        },
-      ],
-      metadata: { custom_id: path },
+      // One user message with one `image_url` part per image, in order.
+      input: await Promise.all(
+        requestPaths.map(async (path) => [
+          {
+            role: "user",
+            content: [
+              {
+                type: "image_url",
+                image_url: { url: `data:image/jpeg;base64,${(await readFile(join(folder, path))).toString("base64")}` },
+              },
+            ],
+          },
+        ]),
+      ),
+      metadata: { custom_ids: requestPaths },
     })),
   );
   const body = JSON.stringify({ requests, webhook_id: webhookId });
