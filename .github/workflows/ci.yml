@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # pnpm, Yarn, and Bun resolve dependencies fresh (package-lock.json is the only lockfile), so check them weekly too.
+  schedule:
+    - cron: "0 6 * * 1"
 
 jobs:
   check:
@@ -18,3 +21,42 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+
+  package-managers:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: pnpm
+            setup: npm install --global pnpm@10
+            install: pnpm install
+            run: pnpm
+          - name: yarn 1
+            setup: npm install --global yarn@1
+            install: yarn install
+            run: yarn
+          - name: yarn berry
+            setup: corepack yarn@stable --version
+            install: corepack yarn@stable install
+            run: corepack yarn@stable
+          - name: bun
+            setup: npm install --global bun
+            install: bun install
+            run: bun run
+    env:
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      # Yarn 2+ refuses to create a lockfile on CI by default; this repo has none for Yarn.
+      YARN_ENABLE_IMMUTABLE_INSTALLS: "false"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: ${{ matrix.setup }}
+      - run: ${{ matrix.install }}
+      - run: ${{ matrix.run }} test
+      - run: ${{ matrix.run }} cli --help
+      - run: ${{ matrix.run }} cli list
+      - run: ${{ matrix.run }} build
