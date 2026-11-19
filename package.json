@@ -5,7 +5,14 @@
   "description": "Cloudflare Worker that saves inference.net async webhook results to Amazon S3 or any S3-compatible bucket.",
   "license": "MIT",
   "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "bin": {
+    "webhook-s3": "cli/main.ts"
+  },
   "scripts": {
+    "cli": "node cli/main.ts",
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
     "build": "wrangler deploy --dry-run --outdir dist",
@@ -13,12 +20,21 @@
     "typecheck": "tsc"
   },
   "dependencies": {
-    "aws4fetch": "1.0.20"
+    "@inquirer/prompts": "8.7.5",
+    "aws4fetch": "1.0.20",
+    "commander": "15.0.0"
   },
   "devDependencies": {
     "@types/node": "24.19.2",
     "typescript": "7.0.2",
+    "vite": "8.3.8",
     "vitest": "5.1.0",
     "wrangler": "4.157.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "workerd"
+    ]
   }
 }

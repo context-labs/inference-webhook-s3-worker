@@ -3,3 +3,12 @@ dist/
 .wrangler/
 .env
 .dev.vars
+.webhook-s3/
+
+# package-lock.json is the only lockfile; see "Package managers" in README.md.
+pnpm-lock.yaml
+yarn.lock
+bun.lock
+bun.lockb
+.yarn/
+.pnp.*
