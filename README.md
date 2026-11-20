@@ -56,7 +56,7 @@ Every command takes the Worker name you chose in setup.
 
 | Command | What it does |
 | --- | --- |
-| `npm run cli -- status <name>` | Checks that the Worker is deployed and reachable, has every setting, can write to S3, and when it last saved a delivery or rejected one. Exits non-zero when a check fails, including when the latest delivery failed. |
+| `npm run cli -- status <name>` | Checks that the Worker is deployed and reachable, has every setting, can write to S3, and when it last saved a delivery or rejected one. Exits non-zero when a check fails, including when the latest delivery failed. A new delivery can take a minute to show up (Workers KV caches reads). |
 | `npm run cli -- test <name>` | Sends a test delivery to the Worker, the same request inference.net sends, and confirms that S3 stored it. |
 | `npm run cli -- logs <name>` | Streams live Worker logs: one line for each saved or rejected delivery, with the event, the object key, or the reason. |
 | `npm run cli -- config <name>` | Shows the settings and the webhook URL. With flags, changes them and redeploys: `--bucket`, `--region`, `--prefix`, `--endpoint`, `--webhook-id`, `--rotate-s3-keys`, `--rotate-path-secret`. |

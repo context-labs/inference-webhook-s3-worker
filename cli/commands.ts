@@ -178,7 +178,7 @@ async function deployNew(
     testDelivery = await waitForTestDelivery(deps, deployment, secrets, startedAt);
   }
 
-  out.heading(`Done. ${name} is live.`);
+  out.heading(secrets.webhookId ? `Done. ${name} is live.` : `Deployed ${name}. One step left: store the webhook identifier.`);
   out.info(`  Webhook URL:   ${code(webhookUrl)}`);
   out.info(`  Objects go to: ${s3.bucket}/${s3.keyPrefix}{groups,generations}/<id>.json`);
   if (secrets.webhookId) out.next(cli(`status ${name}`), cli(`test ${name}`), cli(`logs ${name}`));
@@ -250,7 +250,9 @@ export async function status(deps: Deps, name: string) {
         check: "deliveries",
         ok: last !== null,
         detail: last ? `Last delivery ${ago(deps, last.at)}: ${last.event} → ${last.key}` : "No deliveries recorded yet",
-        fix: last ? null : `Click Test on the webhook in the inference.net dashboard, or run ${cli(`test ${name}`)}.`,
+        fix: last
+          ? null
+          : `In the dashboard, open the webhook's menu and choose Test Webhook, or run ${cli(`test ${name}`)}. A new delivery can take a minute to show here.`,
       },
       true,
     );
