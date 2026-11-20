@@ -72,7 +72,7 @@ const LAST_ERROR_KEY = "last-error";
 
 // KV allows about one write per second per key and bills per write, so each
 // isolate records a delivery at most once a minute and an error at most every
-// 10 seconds. Dashboard test events are always recorded.
+// 10 seconds. Test deliveries are always recorded, so `setup` sees them at once.
 const RECORD_INTERVAL_MS = { [LAST_DELIVERY_KEY]: 60_000, [LAST_ERROR_KEY]: 10_000 };
 const lastRecordedAt = new Map<string, number>();
 
@@ -83,6 +83,12 @@ export default {
     }
     const [, secret = "", action, ...rest] = new URL(request.url).pathname.split("/");
     if (!(await safeEqual(secret, env.WEBHOOK_PATH_SECRET)) || rest.length > 0) {
+      // A delivery with the right webhook id at a wrong path comes from a webhook that still has
+      // an old URL (for example after --rotate-path-secret). Record it, so `status` shows it.
+      const webhookId = request.headers.get("x-inference-webhook-id");
+      if (webhookId && env.INFERENCE_WEBHOOK_ID && (await safeEqual(webhookId, env.INFERENCE_WEBHOOK_ID))) {
+        return fail(env, ctx, request, 404, "Wrong path: the webhook URL on inference.net is out of date");
+      }
       return reply(404, "Not found");
     }
     if (action === "status" && request.method === "GET") {
@@ -99,42 +105,45 @@ export default {
   },
 };
 
+/** Rejects a delivery: logs it, records it as the last error, and answers with `status`. */
+function fail(env: Env, ctx: WorkerContext, request: Request, status: number, message: string): Response {
+  const event = request.headers.get("x-inference-event");
+  console.warn(`Rejected ${event ?? "delivery"} with HTTP ${status}: ${message}`);
+  record(env, ctx, LAST_ERROR_KEY, { at: new Date().toISOString(), event, status, message }, false);
+  return reply(status, message);
+}
+
 async function handleDelivery(request: Request, env: Env, ctx: WorkerContext): Promise<Response> {
   const event = request.headers.get("x-inference-event");
-  const fail = (status: number, message: string): Response => {
-    record(env, ctx, LAST_ERROR_KEY, { at: new Date().toISOString(), event, status, message }, false);
-    return reply(status, message);
-  };
-
   const missing = REQUIRED_SETTINGS.filter((name) => !env[name]);
   if (missing.length > 0) {
-    console.error("Missing settings", missing);
-    return fail(500, `Missing settings: ${missing.join(", ")}`);
+    return fail(env, ctx, request, 500, `Missing settings: ${missing.join(", ")}`);
   }
   const prefix = env.S3_KEY_PREFIX ?? "";
   if (!SAFE_KEY_PREFIX.test(prefix)) {
-    return fail(500, "S3_KEY_PREFIX may only contain A-Z a-z 0-9 / _ . -");
+    return fail(env, ctx, request, 500, "S3_KEY_PREFIX may only contain A-Z a-z 0-9 / _ . -");
   }
   const webhookId = request.headers.get("x-inference-webhook-id") ?? "";
   if (!(await safeEqual(webhookId, env.INFERENCE_WEBHOOK_ID))) {
-    return fail(401, "X-Inference-Webhook-ID does not match INFERENCE_WEBHOOK_ID");
+    return fail(env, ctx, request, 401, "X-Inference-Webhook-ID does not match INFERENCE_WEBHOOK_ID");
   }
   const key = objectKey(request.headers);
   if (!key) {
-    return fail(400, "Unsupported event or missing id header");
+    return fail(env, ctx, request, 400, "Unsupported event or missing id header");
   }
 
   const result = await putObject(env, `${prefix}${key}`, await request.arrayBuffer());
   if (!result.ok) {
-    return fail(502, result.message);
+    return fail(env, ctx, request, 502, result.message);
   }
-  record(
-    env,
-    ctx,
-    LAST_DELIVERY_KEY,
-    { at: new Date().toISOString(), event: event ?? "", key: `${prefix}${key}` },
-    event === "webhook.test",
-  );
+  console.log(`Saved ${event} to ${prefix}${key}`);
+  // Always record test deliveries (the dashboard's Test Webhook sends ids that start with "test-"), and
+  // the first success after an error, so `status` does not keep showing an error that is fixed.
+  const always =
+    event === "webhook.test" ||
+    key.includes("/test-") ||
+    (lastRecordedAt.get(LAST_ERROR_KEY) ?? 0) >= (lastRecordedAt.get(LAST_DELIVERY_KEY) ?? 0);
+  record(env, ctx, LAST_DELIVERY_KEY, { at: new Date().toISOString(), event: event ?? "", key: `${prefix}${key}` }, always);
   return reply(200, `${prefix}${key}`);
 }
 

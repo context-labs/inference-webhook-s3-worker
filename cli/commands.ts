@@ -1,9 +1,10 @@
 import { randomBytes } from "node:crypto";
+import { relative } from "node:path";
 
 import { SAFE_KEY_PREFIX, type WorkerStatus } from "../src/index.ts";
 import { CliError, cli, code, exec, install, type Output } from "./output.ts";
 import type { Prompter } from "./prompt.ts";
-import { probeS3Write, type S3Keys } from "./s3.ts";
+import { bucketRegion, probeS3Write, type S3Keys } from "./s3.ts";
 import { type Deployment, type LocalSecrets, type S3Settings, type StateStore, workerNameError } from "./state.ts";
 import {
   createStatusNamespace,
@@ -35,6 +36,9 @@ const DEFAULT_NAME = "inference-webhook-s3";
 const WORKER_READY_TIMEOUT_MS = 90_000;
 const TEST_DELIVERY_TIMEOUT_MS = 180_000;
 const POLL_INTERVAL_MS = 3_000;
+// A new Worker can take about 3 minutes before Cloudflare lets wrangler turn on its workers.dev URL.
+const DEPLOY_ATTEMPTS = 12;
+const DEPLOY_RETRY_MS = 20_000;
 
 export type Storage = "aws" | "r2" | "other";
 
@@ -75,7 +79,7 @@ export async function setup(deps: Deps, nameArgument: string | undefined, option
   if (await workerExists(deps.wrangler, name, accountId)) {
     throw new CliError(
       `A Worker named ${name} already exists in this Cloudflare account.`,
-      "Pick another name. Worker names are unique per account, and setup never overwrites a Worker it did not create.",
+      "Pick another name. Worker names are unique per account, and setup never overwrites a Worker it did not create. If you deleted this Worker a minute ago, Cloudflare may still list it: wait, then run setup again.",
     );
   }
   out.ok(`${name} is free`);
@@ -105,6 +109,43 @@ export async function setup(deps: Deps, nameArgument: string | undefined, option
   out.heading("4/5  Deploy");
   out.step("Creating a KV namespace for delivery status");
   const statusNamespaceId = await createStatusNamespace(deps.wrangler, `${name}-status`, accountId);
+  try {
+    return await deployNew(deps, { name, accountId, statusNamespaceId, s3, keys, webhookId: options.webhookId ?? null, startedAt });
+  } catch (error) {
+    // Setup already created resources and local state, so a plain rerun stops at "already set up".
+    if (error instanceof CliError) {
+      throw new CliError(
+        error.message,
+        `${error.fix} To start over, run ${cli(`destroy ${name} --yes`)}, then run setup again.`,
+        error.exitCode,
+      );
+    }
+    throw error;
+  }
+}
+
+/** Setup steps 4 and 5, after the status KV namespace exists. */
+async function deployNew(
+  deps: Deps,
+  {
+    name,
+    accountId,
+    statusNamespaceId,
+    s3,
+    keys,
+    webhookId,
+    startedAt,
+  }: {
+    name: string;
+    accountId: string;
+    statusNamespaceId: string;
+    s3: S3Settings;
+    keys: S3Keys;
+    webhookId: string | null;
+    startedAt: Date;
+  },
+) {
+  const { out, prompt } = deps;
   out.ok(`KV namespace ${statusNamespaceId}`);
   const timestamp = deps.now().toISOString();
   let deployment: Deployment = {
@@ -116,7 +157,7 @@ export async function setup(deps: Deps, nameArgument: string | undefined, option
     createdAt: timestamp,
     updatedAt: timestamp,
   };
-  const secrets: LocalSecrets = { pathSecret: randomBytes(32).toString("hex"), webhookId: options.webhookId ?? null };
+  const secrets: LocalSecrets = { pathSecret: randomBytes(32).toString("hex"), webhookId };
   await deps.store.write(deployment);
   await deps.store.writeSecrets(name, secrets);
 
@@ -132,11 +173,14 @@ export async function setup(deps: Deps, nameArgument: string | undefined, option
   const webhookUrl = `${deployment.url}/${secrets.pathSecret}`;
   await registerWebhook(deps, deployment, secrets, webhookUrl);
   let testDelivery = false;
-  if (secrets.webhookId && prompt && (await prompt.confirm("Wait here while you click Test on the webhook in the dashboard?", true))) {
-    testDelivery = await waitForTestDelivery(deps, deployment, secrets, startedAt);
+  if (secrets.webhookId && prompt) {
+    out.info("  To test it, open the webhook's menu in the dashboard, choose Test Webhook, and pick any event.");
+    if (await prompt.confirm("Wait here while you send a test from the dashboard?", true)) {
+      testDelivery = await waitForTestDelivery(deps, deployment, secrets, startedAt);
+    }
   }
 
-  out.heading(`Done. ${name} is live.`);
+  out.heading(secrets.webhookId ? `Done. ${name} is live.` : `Deployed ${name}. One step left: store the webhook identifier.`);
   out.info(`  Webhook URL:   ${code(webhookUrl)}`);
   out.info(`  Objects go to: ${s3.bucket}/${s3.keyPrefix}{groups,generations}/<id>.json`);
   if (secrets.webhookId) out.next(cli(`status ${name}`), cli(`test ${name}`), cli(`logs ${name}`));
@@ -208,25 +252,25 @@ export async function status(deps: Deps, name: string) {
         check: "deliveries",
         ok: last !== null,
         detail: last ? `Last delivery ${ago(deps, last.at)}: ${last.event} → ${last.key}` : "No deliveries recorded yet",
-        fix: last ? null : `Click Test on the webhook in the inference.net dashboard, or run ${cli(`test ${name}`)}.`,
+        fix: last
+          ? null
+          : `In the dashboard, open the webhook's menu and choose Test Webhook, or run ${cli(`test ${name}`)}. A new delivery can take a minute to show here.`,
       },
       true,
     );
+    // An error newer than the last saved delivery means deliveries fail now, and inference.net is retrying them.
     const error = workerStatus.lastError;
     if (error && (!last || error.at > last.at)) {
-      add(
-        {
-          check: "last-error",
-          ok: false,
-          detail: `Last error ${ago(deps, error.at)}: HTTP ${error.status} ${error.message}`,
-          fix: errorFix(name, error.status),
-        },
-        true,
-      );
+      add({
+        check: "last-error",
+        ok: false,
+        detail: `Last delivery failed ${ago(deps, error.at)}: HTTP ${error.status} ${error.message}`,
+        fix: `${errorFix(name, error.status)} Then run ${cli(`test ${name}`)}, or send a test from the dashboard, to clear this.`,
+      });
     }
   }
 
-  const ok = checks.every((check) => check.ok || check.check === "deliveries" || check.check === "last-error");
+  const ok = checks.every((check) => check.ok || check.check === "deliveries");
   out.info(ok ? `\n${name} is healthy.` : `\n${name} needs attention. Apply the fixes above.`);
   if (ok) out.next(cli(`test ${name}`), cli(`logs ${name}`));
   else out.next(cli(`status ${name}`));
@@ -341,7 +385,7 @@ export async function config(deps: Deps, name: string, options: ConfigOptions) {
     out.info(`  Bucket:        ${deployment.s3.bucket} (${deployment.s3.region})`);
     out.info(`  Key prefix:    ${deployment.s3.keyPrefix || "(none)"}`);
     out.info(`  Endpoint:      ${deployment.s3.endpoint ?? "AWS S3"}`);
-    out.info(`  State files:   ${deps.store.statePath(name)}, ${deps.store.secretsPath(name)}`);
+    out.info(`  State files:   ${relative(process.cwd(), deps.store.statePath(name))}, ${relative(process.cwd(), deps.store.secretsPath(name))}`);
     out.info(`\n  Change settings with flags, for example ${cli(`config ${name} --prefix embeddings/`)}.`);
     out.next(cli(`status ${name}`), cli("config --help"));
     const result = { ok: true, ...deployment, webhookUrl: webhookUrl(), webhookId: secrets.webhookId };
@@ -406,7 +450,7 @@ export async function list(deps: Deps) {
 /** `destroy`: deletes the Worker, its KV namespace, and the local state. Objects in S3 stay. */
 export async function destroy(deps: Deps, name: string, options: { yes?: boolean }) {
   const { out, prompt } = deps;
-  const { deployment } = await load(deps, name);
+  const { deployment, secrets } = await load(deps, name);
   if (!options.yes) {
     if (!prompt) throw new CliError("destroy needs confirmation.", `Run it in a terminal, or run ${cli(`destroy ${name} --yes`)}.`, 2);
     const typed = await prompt.input(`This deletes Worker ${name}. Deliveries to it will fail. Type the name to confirm`);
@@ -421,7 +465,10 @@ export async function destroy(deps: Deps, name: string, options: { yes?: boolean
   out.ok("KV namespace deleted");
   await deps.store.remove(name);
   out.ok("Local state removed");
-  out.info(`\nObjects in ${deployment.s3.bucket} were not touched. Delete the webhook in the inference.net dashboard too.`);
+  out.info(`\nObjects in ${deployment.s3.bucket}/${deployment.s3.keyPrefix} were not touched.`);
+  if (secrets.webhookId) {
+    out.info(`Delete webhook ${secrets.webhookId} in the inference.net dashboard too (Settings → Integrations), or it keeps retrying failed deliveries.`);
+  }
   out.next(cli("list"));
   const result = { ok: true, name, worker };
   out.result(result);
@@ -485,8 +532,12 @@ async function askS3Settings(deps: Deps, options: SetupOptions, accountId: strin
           ])
         : "aws");
   const bucket = options.bucket ?? (await ask(deps, "Bucket name", {}, "--bucket"));
+  const detectedRegion = storage === "aws" && !options.region ? await bucketRegion(deps.fetch, bucket) : null;
+  if (detectedRegion) deps.out.ok(`Bucket ${bucket} is in region ${detectedRegion}`);
   const region =
-    options.region ?? (storage === "r2" ? "auto" : await ask(deps, "Bucket region", { default: "us-east-1" }, "--region"));
+    options.region ??
+    detectedRegion ??
+    (storage === "r2" ? "auto" : await ask(deps, "Bucket region", { default: "us-east-1" }, "--region"));
   const endpoint =
     options.endpoint ??
     (storage === "r2"
@@ -506,6 +557,7 @@ async function askS3Settings(deps: Deps, options: SetupOptions, accountId: strin
 }
 
 async function askS3Keys(deps: Deps, options: { accessKeyId?: string; secretAccessKey?: string }): Promise<S3Keys> {
+  if (!options.accessKeyId && deps.env.AWS_ACCESS_KEY_ID) deps.out.info("    Using the access key in AWS_ACCESS_KEY_ID.");
   const accessKeyId =
     options.accessKeyId ?? deps.env.AWS_ACCESS_KEY_ID ?? (await ask(deps, "Access key id", {}, "--access-key-id or AWS_ACCESS_KEY_ID"));
   const secretAccessKey =
@@ -561,7 +613,18 @@ async function load(deps: Deps, name: string): Promise<{ deployment: Deployment;
 async function deploy(deps: Deps, deployment: Deployment): Promise<Deployment> {
   deps.out.step(`Deploying ${deployment.name}`);
   const configPath = await deps.store.writeWranglerConfig(deployment, deps.compatibilityDate);
-  const url = await deployWorker(deps.wrangler, configPath, deployment.accountId);
+  let url: string;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      url = await deployWorker(deps.wrangler, configPath, deployment.accountId);
+      break;
+    } catch (error) {
+      // Cloudflare can answer "Worker does not exist" right after the upload of a new Worker.
+      if (!(error instanceof CliError && /code: 10007/.test(error.message)) || attempt === DEPLOY_ATTEMPTS) throw error;
+      if (attempt === 1) deps.out.info("    Cloudflare is still creating the Worker. This can take 3 minutes; retrying every 20 seconds.");
+      await deps.sleep(DEPLOY_RETRY_MS);
+    }
+  }
   const deployed = { ...deployment, url, updatedAt: deps.now().toISOString() };
   await deps.store.write(deployed);
   deps.out.ok(`Deployed to ${url}`);
@@ -657,8 +720,8 @@ async function waitForTestDelivery(deps: Deps, deployment: Deployment, secrets: 
   while (deps.now().getTime() < deadline) {
     const workerStatus = await fetchStatus(deps, deployment, secrets, false);
     const last = workerStatus?.lastDelivery;
-    if (last?.event === "webhook.test" && new Date(last.at) >= since) {
-      deps.out.ok(`Test delivery received and saved to ${last.key}`);
+    if (last && new Date(last.at) >= since) {
+      deps.out.ok(`${last.event} delivery received and saved to ${last.key}`);
       return true;
     }
     const error = workerStatus?.lastError;
@@ -668,7 +731,7 @@ async function waitForTestDelivery(deps: Deps, deployment: Deployment, secrets: 
     }
     await deps.sleep(POLL_INTERVAL_MS);
   }
-  deps.out.warn("No test delivery arrived.", `Click Test on the webhook, then run ${cli(`status ${deployment.name}`)}.`);
+  deps.out.warn("No test delivery arrived.", `Send a test from the dashboard, then run ${cli(`status ${deployment.name}`)}.`);
   return false;
 }
 

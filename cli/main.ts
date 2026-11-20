@@ -79,13 +79,16 @@ function examples(...items: Array<[note: string, args: string]>): string {
 }
 
 const program = new Command()
-  .name("webhook-s3")
+  // Usage lines show the command as the user runs it, for example "npm run cli -- status <name>".
+  .name(command("").trimEnd())
   .description("Set up, check, and manage a Cloudflare Worker that saves inference.net webhook results to S3.")
   .version(version)
   .option("--json", "print one JSON result on stdout and never ask questions")
   .option("-y, --yes", "never ask questions; fail when a required value is missing")
   .option("--no-color", "turn off colors (also off with NO_COLOR=1 or when output is not a terminal)")
   .showHelpAfterError()
+  // Subcommands copy this, so `status --help` also lists --json, --yes, and --no-color.
+  .configureHelp({ showGlobalOptions: true })
   // Usage errors (unknown command or flag, missing argument) exit 2; help with no command exits 0.
   .exitOverride((error) => process.exit(error.exitCode === 0 || error.code === "commander.help" ? 0 : 2))
   .addHelpText(
@@ -113,7 +116,7 @@ program
   .argument("[name]", "Worker name, unique in your Cloudflare account: lowercase letters, digits, dashes (default: asks; inference-webhook-s3 with --yes)")
   .addOption(new Option("--storage <type>", "where results go (default: asks; aws with --yes, other with --endpoint)").choices(["aws", "r2", "other"]))
   .option("--bucket <bucket>", "bucket name (default: asks)")
-  .option("--region <region>", "bucket region (default: asks, us-east-1; auto for R2)")
+  .option("--region <region>", "bucket region (default: the bucket's region on Amazon S3, else asks; auto for R2)")
   .option("--prefix <prefix>", "key prefix, for example embeddings/ (default: asks; none with --yes)")
   .option("--endpoint <url>", "S3-compatible endpoint URL for MinIO and others (default: AWS S3; the account's endpoint for R2)")
   .option("--access-key-id <id>", "S3 access key id (default: AWS_ACCESS_KEY_ID, else asks)")
