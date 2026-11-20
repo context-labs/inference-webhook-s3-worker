@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { join } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 
 import { CliError, exec, install } from "./output.ts";
 
@@ -132,7 +133,8 @@ function wranglerError(
   result: WranglerResult,
   fix = `Check your Cloudflare login with ${exec("wrangler whoami")}, then run the command again.`,
 ): CliError {
-  const detail = (result.stderr || result.stdout)
+  // Wrangler colors its errors even with FORCE_COLOR=0.
+  const detail = stripVTControlCharacters(result.stderr || result.stdout)
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("🪵") && !line.startsWith("⛅️") && !/^─+$/.test(line))

@@ -43,6 +43,23 @@ export async function probeS3Write(settings: S3Settings, keys: S3Keys): Promise<
   return { key, deleted };
 }
 
+/**
+ * The region of an Amazon S3 bucket, or null when S3 does not say. S3 names it
+ * in the x-amz-bucket-region header even for a request without credentials.
+ */
+export async function bucketRegion(fetch: typeof globalThis.fetch, bucket: string): Promise<string | null> {
+  try {
+    const response = await fetch(`https://s3.amazonaws.com/${bucket}`, {
+      method: "HEAD",
+      redirect: "manual",
+      signal: AbortSignal.timeout(10_000),
+    });
+    return response.headers.get("x-amz-bucket-region");
+  } catch {
+    return null;
+  }
+}
+
 function s3WriteError(settings: S3Settings, status: number, body: string, bucketRegion: string | null): CliError {
   const s3Code = /<Code>([^<]+)<\/Code>/.exec(body)?.[1] ?? `HTTP ${status}`;
   const where = `${settings.bucket}/${settings.keyPrefix}`;
@@ -59,11 +76,16 @@ function s3WriteError(settings: S3Settings, status: number, body: string, bucket
     case "InvalidAccessKeyId":
       return new CliError("The access key id does not exist.", "Check S3_ACCESS_KEY_ID, or create a new access key.");
     case "SignatureDoesNotMatch":
-      return new CliError("The secret access key does not match the access key id.", "Paste the secret access key again.");
+      return new CliError(
+        "The secret access key does not match the access key id.",
+        "Paste the secret access key again, or check AWS_SECRET_ACCESS_KEY.",
+      );
     case "AccessDenied":
       return new CliError(
         `The key cannot write to ${where}.`,
-        `Allow s3:PutObject on arn:aws:s3:::${where}* (see "IAM policy" in the README).`,
+        settings.endpoint
+          ? `Check the bucket name, and give the key write access to bucket ${settings.bucket} (for Cloudflare R2: an API token with Object Read & Write on that bucket).`
+          : `Allow s3:PutObject on arn:aws:s3:::${where}* (see "IAM policy" in the README).`,
       );
     default:
       return new CliError(`S3 rejected the test write to ${where}: ${s3Code}.`, "Check the bucket, region, and key permissions.");

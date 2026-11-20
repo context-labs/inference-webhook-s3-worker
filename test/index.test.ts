@@ -224,4 +224,41 @@ describe("status route", () => {
     });
     expect(JSON.parse(store.data.get("last-error") ?? "null")).toMatchObject({ status: 401 });
   });
+
+  it("always records dashboard test events, which carry ids that start with test-", async () => {
+    vi.resetModules();
+    const { default: freshWorker } = await import("../src/index");
+    const store = kv();
+    const pending: Promise<unknown>[] = [];
+    const recordingCtx = { waitUntil: (promise: Promise<unknown>) => pending.push(promise) };
+
+    mockS3(new Response(null, { status: 200 }), new Response(null, { status: 200 }));
+    await freshWorker.fetch(delivery(), { ...env, STATUS: store }, recordingCtx);
+    await freshWorker.fetch(
+      delivery({ headers: { "X-Inference-Group-ID": "test-group-1795132156487" } }),
+      { ...env, STATUS: store },
+      recordingCtx,
+    );
+    await Promise.all(pending);
+
+    expect(JSON.parse(store.data.get("last-delivery") ?? "null")).toMatchObject({
+      event: "slow-group.completed",
+      key: "embeddings/groups/test-group-1795132156487.json",
+    });
+  });
+
+  it("records a delivery to an old webhook URL, but not other wrong paths", async () => {
+    const store = kv();
+    const pending: Promise<unknown>[] = [];
+    const recordingCtx = { waitUntil: (promise: Promise<unknown>) => pending.push(promise) };
+
+    const stranger = delivery({ path: "/old-secret", headers: { "X-Inference-Webhook-ID": "other" } });
+    expect((await worker.fetch(stranger, { ...env, STATUS: store }, recordingCtx)).status).toBe(404);
+    expect(store.data.has("last-error")).toBe(false);
+
+    const oldUrl = await worker.fetch(delivery({ path: "/old-secret" }), { ...env, STATUS: store }, recordingCtx);
+    await Promise.all(pending);
+    expect(oldUrl.status).toBe(404);
+    expect(JSON.parse(store.data.get("last-error") ?? "null")).toMatchObject({ status: 404, event: "slow-group.completed" });
+  });
 });
