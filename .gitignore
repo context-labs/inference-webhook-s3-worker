@@ -12,3 +12,4 @@ bun.lock
 bun.lockb
 .yarn/
 .pnp.*
+__pycache__/

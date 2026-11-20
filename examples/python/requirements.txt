@@ -1,0 +1,2 @@
+numpy
+boto3  # only for s3:// paths
