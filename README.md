@@ -14,7 +14,7 @@ your code ──POST──▶ inference.net async API ──webhook──▶ thi
 ## Prerequisites
 
 - [ ] Node.js 22.18 or later
-- [ ] A Cloudflare account on the **Workers Paid** plan. The Worker uses up to 12.4 ms of CPU per request (p99 under load), above the Free plan's 10 ms limit.
+- [ ] A Cloudflare account on the **Workers Paid** plan. The Worker uses about 15 ms of CPU per request at p99 (23 ms at p99.9) at 5,000 images/s, above the Free plan's 10 ms limit.
 - [ ] An S3 bucket, plus an access key that can `s3:PutObject` to your key prefix. See the IAM policy under [Reference](#reference).
 - [ ] An inference.net API key
 
@@ -183,7 +183,7 @@ Every command takes the Worker name you chose in setup. Add `--help` to any comm
 | --- | --- |
 | `npm run cli -- status <name>` | Checks the Worker end to end, and shows the last saved or rejected delivery. Exits 1 when a check fails. |
 | `npm run cli -- test <name>` | Sends a test delivery through the Worker and confirms that S3 stored it. `--remote` has inference.net send it. |
-| `npm run cli -- logs <name>` | Streams live logs: one line per saved or rejected delivery. |
+| `npm run cli -- logs <name>` | Streams live logs: for each delivery, a request line and a `Saved …` or `Rejected … with HTTP <status>` line. The request line says `Ok` also for a rejected delivery: `Ok` means only that the Worker did not crash. |
 | `npm run cli -- config <name>` | Shows the settings and the webhook URL. With flags, changes them and redeploys. |
 | `npm run cli -- update <name>` | Deploys the code in this folder, for example after `git pull`. |
 | `npm run cli -- list` | Lists the Workers set up from this folder. |
