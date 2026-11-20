@@ -10,6 +10,8 @@ A Cloudflare Worker that receives [inference.net](https://inference.net) async-i
 
 You need Node.js 22.18 or later, a Cloudflare account, and an S3 bucket with an access key that can `s3:PutObject` to it (see [IAM policy](#iam-policy)).
 
+Optional: an inference.net API key with write access, created by a team owner or admin. With it, setup creates the webhook for you and inference.net sends a real test delivery. Run `export INFERENCE_API_KEY=...` first, or paste the key when setup asks. Without a key, setup walks you through the dashboard.
+
 ```sh
 git clone https://github.com/context-labs/inference-webhook-s3-worker.git && cd inference-webhook-s3-worker
 ```
@@ -25,11 +27,15 @@ Then install and start setup with your package manager:
 
 `setup` asks for each value and checks it before it moves on:
 
-1. **Check tools.** Node.js version, wrangler, and your Cloudflare login. It offers to run `wrangler login` if you are not logged in.
+1. **Check tools.** Node.js version, wrangler, and your Cloudflare login. It offers to run `wrangler login` if you are not logged in. It reads your inference.net API key from `INFERENCE_API_KEY`, or asks for it (press Enter to skip), and checks it.
 2. **Name the Worker.** The name identifies this deployment in every later command. Worker names are unique per Cloudflare account, so setup stops if the name is taken.
 3. **Connect the bucket.** Amazon S3, Cloudflare R2, or another S3-compatible service. For Amazon S3, setup finds the bucket's region itself. Setup writes a test object with your key before it deploys anything, and tells you exactly what to fix if S3 refuses.
 4. **Deploy.** It stores your settings as encrypted Worker secrets, deploys the Worker, and checks that the deployed Worker can write to S3.
-5. **Register the webhook.** It prints your webhook URL. In the inference.net dashboard, open **Settings** → **Integrations** → **Create Webhook**, paste the URL, and paste the webhook identifier back into setup. Then open the webhook's menu, choose **Test Webhook**, and pick any event; setup waits until the test delivery is in your bucket.
+5. **Register the webhook.**
+   - With an API key: setup creates the webhook on inference.net, named after the Worker, and stores its identifier in the Worker. Then inference.net sends a `webhook.test` delivery, and setup waits until it is in your bucket.
+   - Without one: setup prints your webhook URL. In the inference.net dashboard, open **Settings** → **Integrations** → **Create Webhook**, paste the URL, and paste the webhook identifier back into setup. Then open the webhook's menu, choose **Test Webhook**, and pick any event; setup waits until the test delivery is in your bucket.
+
+The CLI never saves your API key and never prints it. Set `INFERENCE_API_KEY` when you run later commands, and they manage the webhook too.
 
 Then send requests with that webhook identifier (see [Example client](#example-client)).
 
@@ -56,13 +62,15 @@ Every command takes the Worker name you chose in setup.
 
 | Command | What it does |
 | --- | --- |
-| `npm run cli -- status <name>` | Checks that the Worker is deployed and reachable, has every setting, can write to S3, and when it last saved a delivery or rejected one. Exits non-zero when a check fails, including when the latest delivery failed. A new delivery can take a minute to show up (Workers KV caches reads). |
-| `npm run cli -- test <name>` | Sends a test delivery to the Worker, the same request inference.net sends, and confirms that S3 stored it. |
+| `npm run cli -- status <name>` | Checks that the Worker is deployed and reachable, has every setting, can write to S3, and when it last saved a delivery or rejected one. With `INFERENCE_API_KEY`, also checks that the webhook on inference.net exists, is on, and sends to this Worker. Exits non-zero when a check fails, including when the latest delivery failed. A new delivery can take a minute to show up (Workers KV caches reads). |
+| `npm run cli -- test <name>` | Sends a test delivery to the Worker, the same request inference.net sends, and confirms that S3 stored it. With `--remote` and `INFERENCE_API_KEY`, inference.net sends a real delivery instead. |
 | `npm run cli -- logs <name>` | Streams live Worker logs: one line for each saved or rejected delivery, with the event, the object key, or the reason. |
-| `npm run cli -- config <name>` | Shows the settings and the webhook URL. With flags, changes them and redeploys: `--bucket`, `--region`, `--prefix`, `--endpoint`, `--webhook-id`, `--rotate-s3-keys`, `--rotate-path-secret`. |
+| `npm run cli -- config <name>` | Shows the settings and the webhook URL. With flags, changes them and redeploys: `--bucket`, `--region`, `--prefix`, `--endpoint`, `--webhook-id`, `--rotate-s3-keys`, `--rotate-path-secret`. With `INFERENCE_API_KEY`, `--rotate-path-secret` also sets the new URL on the webhook. |
 | `npm run cli -- update <name>` | Deploys the code in this folder, for example after `git pull`. |
 | `npm run cli -- list` | Lists the Workers set up from this folder. |
-| `npm run cli -- destroy <name>` | Deletes the Worker and its status store, after you type its name. Objects in S3 stay. |
+| `npm run cli -- destroy <name>` | Deletes the Worker and its status store, after you type its name. With `INFERENCE_API_KEY`, offers to delete the webhook too (`--yes` deletes it). Objects in S3 stay. |
+
+`status`, `test --remote`, `config`, and `destroy` use the webhook API only for a webhook that setup created through it. For a webhook you created in the dashboard, they print the dashboard step instead.
 
 Add `--help` to any command for its flags, their defaults, and examples. Every command ends with the command to run next, and every error ends with a fix. Colors turn off with `--no-color`, with `NO_COLOR=1`, and when the output is not a terminal.
 
@@ -93,10 +101,12 @@ Next: npm run cli -- test my-embeddings   npm run cli -- logs my-embeddings
 - `--json` prints one JSON result on stdout (including errors, as `{"ok": false, "error", "fix"}`) and never asks questions.
 - `--yes` never asks questions. A missing value fails with the flag to pass.
 - `setup` reads every value from flags: `--storage aws|r2|other`, `--bucket`, `--region`, `--prefix`, `--endpoint`, `--webhook-id`, `--account-id`. Pass S3 keys as `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, not as flags, so they stay out of shell history.
+- With `INFERENCE_API_KEY` set, `setup` creates the webhook and sends a test delivery with no questions. The API key has no flag. Without it, `setup --yes` deploys the Worker and ends with the command that stores the webhook identifier.
+- `INFERENCE_API_URL` changes the API base URL. Default: `https://relay.inference.net/api/rest`.
 - Run `node cli/main.ts` in scripts. npm, pnpm, and Yarn 1 print a banner on stdout before a script's output, which breaks `--json` parsing.
 
 ```sh
-AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+INFERENCE_API_KEY=... AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
   node cli/main.ts setup my-embeddings --yes --bucket my-embeddings --region us-east-1 --prefix embeddings/
 node cli/main.ts status my-embeddings --json | jq .ok
 ```
@@ -107,11 +117,11 @@ The CLI keeps three files per Worker in `.webhook-s3/` (git-ignored):
 
 | File | Contents |
 | --- | --- |
-| `<name>.json` | Account id, Worker URL, bucket, region, prefix, endpoint, status KV namespace id. No secrets. |
+| `<name>.json` | Account id, Worker URL, bucket, region, prefix, endpoint, status KV namespace id, and the webhook's API id when setup created it. No secrets. |
 | `<name>.secrets.json` | The webhook URL path secret and the webhook identifier, which `status` and `test` need to call the Worker. Readable by your user only. |
 | `<name>.wrangler.json` | The Wrangler config the CLI deploys with. |
 
-S3 keys are never written to disk. To manage a Worker from another machine, copy these files to that machine's `.webhook-s3/`.
+S3 keys and the inference.net API key are never written to disk. To manage a Worker from another machine, copy these files to that machine's `.webhook-s3/`.
 
 ## Configuration
 
@@ -137,7 +147,7 @@ The CLI also binds a KV namespace as `STATUS`. The Worker records its last deliv
 | `slow-group.completed` (Group API) | `<S3_KEY_PREFIX>groups/<groupId>.json` |
 | `async-embedding.completed` | `<S3_KEY_PREFIX>generations/<generationId>.json` |
 | `generation.completed` | `<S3_KEY_PREFIX>generations/<generationId>.json` |
-| `webhook.test` (`test` command) | `<S3_KEY_PREFIX>tests/webhook-test.json` |
+| `webhook.test` (`test`, `test --remote`, and setup with an API key) | `<S3_KEY_PREFIX>tests/webhook-test.json` |
 
 The dashboard's **Test Webhook** sends a sample `generation.completed`, `slow-group.completed`, or `async-embedding.completed` event with an id that starts with `test-`, so it lands at, for example, `<S3_KEY_PREFIX>groups/test-group-1795132156487.json`.
 

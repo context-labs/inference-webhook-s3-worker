@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { relative } from "node:path";
 
 import { SAFE_KEY_PREFIX, type WorkerStatus } from "../src/index.ts";
+import { InferenceApi, type Webhook } from "./inference.ts";
 import { CliError, cli, code, exec, install, type Output } from "./output.ts";
 import type { Prompter } from "./prompt.ts";
 import { bucketRegion, probeS3Write, type S3Keys } from "./s3.ts";
@@ -56,7 +57,7 @@ export interface SetupOptions {
   dryRun?: boolean;
 }
 
-/** `setup`: checks tools, asks for settings, proves S3 access, deploys, and walks through webhook registration. */
+/** `setup`: checks tools, asks for settings, proves S3 access, deploys, and registers the webhook (through the API, or the dashboard). */
 export async function setup(deps: Deps, nameArgument: string | undefined, options: SetupOptions) {
   const { out, prompt } = deps;
   const startedAt = deps.now();
@@ -64,6 +65,7 @@ export async function setup(deps: Deps, nameArgument: string | undefined, option
   if (earlyNameError) throw new CliError(earlyNameError, `Example: ${cli(`setup ${DEFAULT_NAME}`)}`, 2);
   out.heading("1/5  Check tools");
   const accountId = await checkTools(deps, options.accountId);
+  const api = options.webhookId ? null : await connectApi(deps);
 
   out.heading("2/5  Name the Worker");
   const name = nameArgument ?? (await ask(deps, "Worker name (unique in your Cloudflare account)", { default: DEFAULT_NAME }, "the name argument"));
@@ -99,7 +101,11 @@ export async function setup(deps: Deps, nameArgument: string | undefined, option
     out.info(`    1. Create KV namespace ${name}-status in account ${accountId}`);
     out.info(`    2. Deploy Worker ${name} to https://${name}.<your-subdomain>.workers.dev`);
     out.info(`    3. Store ${secretNames.length} encrypted Worker secrets: ${secretNames.join(", ")}`);
-    out.info(`    4. Check the deployed Worker, then walk you through registering the webhook URL on inference.net`);
+    out.info(
+      api
+        ? "    4. Check the deployed Worker, create the webhook on inference.net through the API, and have inference.net send a test delivery"
+        : "    4. Check the deployed Worker, then walk you through registering the webhook URL on inference.net",
+    );
     out.next(`${cli(`setup ${name}`)} with the same flags, without --dry-run`);
     const result = { ok: true, dryRun: true, name, accountId, s3, secrets: secretNames };
     out.result(result);
@@ -110,7 +116,7 @@ export async function setup(deps: Deps, nameArgument: string | undefined, option
   out.step("Creating a KV namespace for delivery status");
   const statusNamespaceId = await createStatusNamespace(deps.wrangler, `${name}-status`, accountId);
   try {
-    return await deployNew(deps, { name, accountId, statusNamespaceId, s3, keys, webhookId: options.webhookId ?? null, startedAt });
+    return await deployNew(deps, { name, accountId, statusNamespaceId, s3, keys, webhookId: options.webhookId ?? null, api, startedAt });
   } catch (error) {
     // Setup already created resources and local state, so a plain rerun stops at "already set up".
     if (error instanceof CliError) {
@@ -134,6 +140,7 @@ async function deployNew(
     s3,
     keys,
     webhookId,
+    api,
     startedAt,
   }: {
     name: string;
@@ -142,6 +149,7 @@ async function deployNew(
     s3: S3Settings;
     keys: S3Keys;
     webhookId: string | null;
+    api: InferenceApi | null;
     startedAt: Date;
   },
 ) {
@@ -171,9 +179,22 @@ async function deployNew(
 
   out.heading("5/5  Register the webhook on inference.net");
   const webhookUrl = `${deployment.url}/${secrets.pathSecret}`;
-  await registerWebhook(deps, deployment, secrets, webhookUrl);
   let testDelivery = false;
-  if (secrets.webhookId && prompt) {
+  if (api) {
+    out.step(`Creating webhook ${name} on inference.net`);
+    const webhook = await api.create(webhookUrl, name);
+    deployment = { ...deployment, apiWebhookId: webhook.id };
+    await deps.store.write(deployment);
+    out.ok(`Created webhook ${webhook.identifier} with URL ${code(webhookUrl)}`);
+    await setWebhookId(deps, deployment, secrets, webhook.identifier);
+    testDelivery = await remoteTestDelivery(deps, { api, id: webhook.id }, deployment, secrets);
+    if (!deps.env.INFERENCE_API_KEY) {
+      out.info(`  The CLI did not save your API key. Set INFERENCE_API_KEY when you run status, test --remote, config, or destroy, and they manage the webhook too.`);
+    }
+  } else {
+    await registerWebhook(deps, deployment, secrets, webhookUrl);
+  }
+  if (!api && secrets.webhookId && prompt) {
     out.info("  To test it, open the webhook's menu in the dashboard, choose Test Webhook, and pick any event.");
     if (await prompt.confirm("Wait here while you send a test from the dashboard?", true)) {
       testDelivery = await waitForTestDelivery(deps, deployment, secrets, startedAt);
@@ -185,7 +206,17 @@ async function deployNew(
   out.info(`  Objects go to: ${s3.bucket}/${s3.keyPrefix}{groups,generations}/<id>.json`);
   if (secrets.webhookId) out.next(cli(`status ${name}`), cli(`test ${name}`), cli(`logs ${name}`));
   else out.next(cli(`config ${name} --webhook-id <identifier>`));
-  const result = { ok: true, name, accountId, url: deployment.url, webhookUrl, webhookIdSet: Boolean(secrets.webhookId), testDelivery, s3 };
+  const result = {
+    ok: true,
+    name,
+    accountId,
+    url: deployment.url,
+    webhookUrl,
+    webhookIdSet: Boolean(secrets.webhookId),
+    webhookCreated: Boolean(api),
+    testDelivery,
+    s3,
+  };
   out.result(result);
   return result;
 }
@@ -217,6 +248,9 @@ export async function status(deps: Deps, name: string) {
     detail: deployed ? `Deployed in account ${deployment.accountId}` : "The Worker is not deployed in the Cloudflare account",
     fix: deployed ? null : `Run ${cli(`update ${name}`)} to deploy it again.`,
   });
+
+  const remote = webhookApi(deps, deployment);
+  if (remote) add(await webhookCheck(remote, `${deployment.url}/${secrets.pathSecret}`, secrets, name));
 
   const workerStatus = deployed ? await fetchStatus(deps, deployment, secrets, true) : null;
   if (deployed) {
@@ -279,12 +313,33 @@ export async function status(deps: Deps, name: string) {
   return result;
 }
 
-/** `test`: sends a signed-off synthetic delivery through the real Worker and S3. */
-export async function test(deps: Deps, name: string) {
+/**
+ * `test`: sends a synthetic delivery through the real Worker and S3. With `remote`, inference.net
+ * sends a real one through the webhook API instead.
+ */
+export async function test(deps: Deps, name: string, options: { remote?: boolean } = {}) {
   const { out } = deps;
   const { deployment, secrets } = await load(deps, name);
   if (!secrets.webhookId) {
     throw new CliError(`${name} has no webhook identifier yet.`, `Run ${cli(`config ${name} --webhook-id <identifier>`)}.`);
+  }
+  if (options.remote) {
+    const remote = webhookApi(deps, deployment);
+    if (!remote) {
+      throw new CliError(
+        deps.env.INFERENCE_API_KEY
+          ? `${name}'s webhook was not created by this CLI, so it cannot be tested through the API.`
+          : "test --remote needs an inference.net API key in INFERENCE_API_KEY.",
+        `${deps.env.INFERENCE_API_KEY ? "" : "Set INFERENCE_API_KEY and run it again, or "}in the inference.net dashboard, open the webhook's menu, choose Test Webhook, and pick any event.`,
+      );
+    }
+    out.heading(`Test ${name} from inference.net`);
+    const delivered = await remoteTestDelivery(deps, remote, deployment, secrets);
+    if (delivered) out.next(cli(`status ${name}`), cli(`logs ${name}`));
+    else out.next(cli(`status ${name}`));
+    const result = { ok: delivered, name, remote: true };
+    out.result(result);
+    return result;
   }
   out.heading(`Test ${name}`);
   out.step("Sending a webhook.test delivery, the same request inference.net sends");
@@ -400,7 +455,12 @@ export async function config(deps: Deps, name: string, options: ConfigOptions) {
   await deps.store.write(deployment);
   await deps.store.writeSecrets(name, secrets);
   out.ok("Wrangler deployed a new version with the new settings");
-  if (options.rotatePathSecret) {
+  const remote = webhookApi(deps, deployment);
+  if (options.rotatePathSecret && remote) {
+    out.step("Updating the webhook URL on inference.net");
+    await remote.api.update(remote.id, { url: webhookUrl() });
+    out.ok(`The webhook now sends to ${code(webhookUrl())}`);
+  } else if (options.rotatePathSecret) {
     out.warn(
       `The webhook URL changed. Deliveries to the old URL now get 404 (inference.net retries them for about 3 days).`,
       `In the inference.net dashboard, set the webhook URL to ${code(webhookUrl())}`,
@@ -456,7 +516,17 @@ export async function destroy(deps: Deps, name: string, options: { yes?: boolean
     const typed = await prompt.input(`This deletes Worker ${name}. Deliveries to it will fail. Type the name to confirm`);
     if (typed.trim() !== name) throw new CliError("The name did not match. Nothing was deleted.", `Run ${cli(`destroy ${name}`)} again and type ${name} exactly.`);
   }
+  const remote = webhookApi(deps, deployment);
+  const deleteWebhook =
+    remote !== null &&
+    (options.yes || !prompt || (await prompt.confirm(`Also delete webhook ${secrets.webhookId} on inference.net? It sends only to this Worker.`, true)));
   out.heading(`Destroy ${name}`);
+  let webhook: "deleted" | "missing" | "kept" = "kept";
+  if (remote && deleteWebhook) {
+    out.step(`Deleting webhook ${secrets.webhookId} on inference.net`);
+    webhook = await remote.api.delete(remote.id);
+    out.ok(webhook === "deleted" ? "Webhook deleted" : "Webhook was already gone");
+  }
   out.step("Deleting the Worker");
   const worker = await deleteWorker(deps.wrangler, name, deployment.accountId);
   out.ok(worker === "deleted" ? "Worker deleted" : "Worker was already gone");
@@ -466,11 +536,11 @@ export async function destroy(deps: Deps, name: string, options: { yes?: boolean
   await deps.store.remove(name);
   out.ok("Local state removed");
   out.info(`\nObjects in ${deployment.s3.bucket}/${deployment.s3.keyPrefix} were not touched.`);
-  if (secrets.webhookId) {
+  if (secrets.webhookId && webhook === "kept") {
     out.info(`Delete webhook ${secrets.webhookId} in the inference.net dashboard too (Settings → Integrations), or it keeps retrying failed deliveries.`);
   }
   out.next(cli("list"));
-  const result = { ok: true, name, worker };
+  const result = { ok: true, name, worker, webhook };
   out.result(result);
   return result;
 }
@@ -643,6 +713,94 @@ function workerSecrets(s3: S3Settings, keys: S3Keys, secrets: LocalSecrets): Rec
     S3_ENDPOINT: s3.endpoint,
   };
   return Object.fromEntries(Object.entries(values).filter((entry): entry is [string, string] => entry[1] !== null));
+}
+
+/** The webhook API with INFERENCE_API_KEY and the webhook's id, for a Worker whose webhook setup created through it; else null. */
+function webhookApi(deps: Deps, deployment: Deployment): { api: InferenceApi; id: string } | null {
+  const key = deps.env.INFERENCE_API_KEY;
+  const id = deployment.apiWebhookId;
+  return key && id ? { api: new InferenceApi(deps.fetch, key, deps.env.INFERENCE_API_URL), id } : null;
+}
+
+/**
+ * Setup: the webhook API, with the key in INFERENCE_API_KEY or one the user types.
+ * Null when there is no key, or this inference.net has no webhook API yet: setup then uses the dashboard.
+ */
+async function connectApi(deps: Deps): Promise<InferenceApi | null> {
+  const { out, prompt } = deps;
+  let key = deps.env.INFERENCE_API_KEY;
+  if (key) out.info("    Using the inference.net API key in INFERENCE_API_KEY.");
+  else if (prompt) {
+    key = (
+      await prompt.password("inference.net API key, to create the webhook for you (press Enter to skip and use the dashboard)", { optional: true })
+    ).trim();
+  }
+  if (!key) return null;
+  const api = new InferenceApi(deps.fetch, key, deps.env.INFERENCE_API_URL);
+  out.step("Checking the inference.net API key");
+  if (!(await api.available())) {
+    out.info("    The inference.net webhook API is not available yet, so setup walks you through the dashboard instead.");
+    return null;
+  }
+  out.ok("The API key can manage webhooks. Setup creates the webhook for you.");
+  return api;
+}
+
+/** Has inference.net send a real webhook.test delivery, then confirms the Worker recorded it. */
+async function remoteTestDelivery(
+  deps: Deps,
+  { api, id }: { api: InferenceApi; id: string },
+  deployment: Deployment,
+  secrets: LocalSecrets,
+): Promise<boolean> {
+  const since = deps.now();
+  deps.out.step("Asking inference.net to send a webhook.test delivery");
+  const delivery = await api.test(id);
+  if (!delivery.success) {
+    deps.out.fail(
+      `inference.net sent it, and the Worker answered HTTP ${delivery.statusCode}${delivery.error ? `: ${delivery.error}` : ""}`,
+      errorFix(deployment.name, delivery.statusCode),
+    );
+    return false;
+  }
+  deps.out.ok("inference.net sent it, and the Worker answered HTTP 200 after S3 stored it");
+  return waitForTestDelivery(deps, deployment, secrets, since);
+}
+
+/** `status` check: the webhook still exists on inference.net, is on, and sends to this Worker with its identifier. */
+async function webhookCheck(
+  { api, id }: { api: InferenceApi; id: string },
+  webhookUrl: string,
+  secrets: LocalSecrets,
+  name: string,
+): Promise<Check> {
+  const check = (ok: boolean, detail: string, fix: string | null): Check => ({ check: "webhook", ok, detail, fix });
+  let webhook: Webhook | null;
+  try {
+    webhook = await api.get(id);
+  } catch (error) {
+    if (error instanceof CliError) return check(false, error.message, error.fix);
+    throw error;
+  }
+  if (!webhook) {
+    return check(
+      false,
+      `Webhook ${secrets.webhookId} no longer exists on inference.net`,
+      `Create one in the dashboard (Settings → Integrations) with the URL from ${cli(`config ${name}`)}, then run ${cli(`config ${name} --webhook-id <identifier>`)}.`,
+    );
+  }
+  if (webhook.isDisabled) return check(false, `Webhook ${webhook.identifier} is turned off on inference.net`, "Turn it on in the dashboard (Settings → Integrations).");
+  if (webhook.url !== webhookUrl) {
+    return check(
+      false,
+      `Webhook ${webhook.identifier} sends to another URL: ${webhook.url}`,
+      `Run ${cli(`config ${name} --rotate-path-secret`)} with INFERENCE_API_KEY set; it sets a new URL on both sides.`,
+    );
+  }
+  if (webhook.identifier !== secrets.webhookId) {
+    return check(false, `Webhook identifier ${webhook.identifier} differs from the Worker's`, `Run ${cli(`config ${name} --webhook-id ${webhook.identifier}`)}.`);
+  }
+  return check(true, `Webhook ${webhook.identifier} on inference.net is on and sends to this Worker`, null);
 }
 
 /**
