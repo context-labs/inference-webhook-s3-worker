@@ -59,6 +59,8 @@ async function submitGroup(paths: string[]): Promise<void> {
   const requests = await Promise.all(
     chunk(paths, IMAGES_PER_REQUEST).map(async (requestPaths) => ({
       model: MODEL,
+      // Each vector arrives as base64 of 768 little-endian float32 values: ~4 KB instead of ~10.5 KB of floats.
+      encoding_format: "base64",
       // One user message with one `image_url` part per image, in order.
       input: await Promise.all(
         requestPaths.map(async (path) => [
@@ -81,7 +83,8 @@ async function submitGroup(paths: string[]): Promise<void> {
   for (let attempt = 1; ; attempt++) {
     const response = await fetch(API_URL, {
       method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      // The API blocks some default User-Agent headers, so send your own.
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", "User-Agent": "inference-webhook-s3-worker-example" },
       body,
     });
     if (response.ok) {

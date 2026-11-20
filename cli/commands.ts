@@ -37,6 +37,8 @@ const DEFAULT_NAME = "inference-webhook-s3";
 const WORKER_READY_TIMEOUT_MS = 90_000;
 const TEST_DELIVERY_TIMEOUT_MS = 180_000;
 const POLL_INTERVAL_MS = 3_000;
+/** Waits between test deliveries that hit a Worker version without the new settings: 60 s in all. */
+const SETTINGS_RETRY_DELAYS_MS = [5_000, 10_000, 15_000, 30_000];
 // A new Worker can take about 3 minutes before Cloudflare lets wrangler turn on its workers.dev URL.
 const DEPLOY_ATTEMPTS = 12;
 const DEPLOY_RETRY_MS = 20_000;
@@ -775,9 +777,18 @@ async function remoteTestDelivery(
   deployment: Deployment,
   secrets: LocalSecrets,
 ): Promise<boolean> {
-  const since = deps.now();
+  let since = deps.now();
   deps.out.step("Asking inference.net to send a webhook.test delivery");
-  const delivery = await api.test(id);
+  let delivery = await api.test(id);
+  // The Worker answers 500 only for missing or invalid settings. Right after a secret change, a
+  // Cloudflare location can still run the old version even after /status showed the new one.
+  for (const delayMs of SETTINGS_RETRY_DELAYS_MS) {
+    if (delivery.success || delivery.statusCode !== 500) break;
+    deps.out.info(`    The Worker answered HTTP 500 (settings missing). Cloudflare may still be rolling out the new settings; retrying in ${delayMs / 1000} s.`);
+    await deps.sleep(delayMs);
+    since = deps.now();
+    delivery = await api.test(id);
+  }
   if (!delivery.success) {
     const answer = delivery.statusCode === 0 ? "the Worker did not answer" : `the Worker answered HTTP ${delivery.statusCode}`;
     deps.out.fail(
