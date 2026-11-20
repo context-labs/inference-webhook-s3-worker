@@ -111,7 +111,7 @@ program
   .alias("init")
   .summary("check tools, connect a bucket, deploy a new Worker, and register the webhook")
   .description(
-    "Check tools, connect a bucket, deploy a new Worker, and register the webhook. Asks for each value it needs and checks it before it moves on.",
+    "Check tools, connect a bucket, deploy a new Worker, and register the webhook. Asks for each value it needs and checks it before it moves on. With an inference.net API key (INFERENCE_API_KEY, or typed when asked), it creates the webhook and sends a real test delivery; without one, it walks you through the dashboard.",
   )
   .argument("[name]", "Worker name, unique in your Cloudflare account: lowercase letters, digits, dashes (default: asks; inference-webhook-s3 with --yes)")
   .addOption(new Option("--storage <type>", "where results go (default: asks; aws with --yes, other with --endpoint)").choices(["aws", "r2", "other"]))
@@ -121,7 +121,10 @@ program
   .option("--endpoint <url>", "S3-compatible endpoint URL for MinIO and others (default: AWS S3; the account's endpoint for R2)")
   .option("--access-key-id <id>", "S3 access key id (default: AWS_ACCESS_KEY_ID, else asks)")
   .option("--secret-access-key <key>", "S3 secret access key; the env var keeps it out of shell history (default: AWS_SECRET_ACCESS_KEY, else asks)")
-  .option("--webhook-id <id>", "inference.net webhook identifier, if you already created the webhook (default: asks after deploy)")
+  .option(
+    "--webhook-id <id>",
+    "inference.net webhook identifier, if you already created the webhook (default: creates it with INFERENCE_API_KEY, else asks after deploy)",
+  )
   .option("--account-id <id>", "Cloudflare account id (default: CLOUDFLARE_ACCOUNT_ID, else your only account, else asks)")
   .option("--dry-run", "run every check, the S3 write probe included, but create nothing in Cloudflare")
   .addHelpText(
@@ -130,7 +133,7 @@ program
       ["Answer each question in the terminal", "setup"],
       ["Check everything first, create nothing", "setup my-results --dry-run"],
       [
-        "No questions (S3 keys from AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)",
+        "No questions (S3 keys from AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY; creates the webhook with INFERENCE_API_KEY)",
         "setup my-results --yes --bucket my-bucket --region us-east-1 --prefix embeddings/",
       ],
     ),
@@ -153,10 +156,20 @@ program
 program
   .command("test")
   .summary("send a test delivery through the Worker and confirm S3 stored it")
-  .description("Send a webhook.test delivery to the Worker, the same request inference.net sends, and confirm that S3 stored it.")
+  .description(
+    "Send a webhook.test delivery to the Worker, the same request inference.net sends, and confirm that S3 stored it. With --remote, inference.net sends it.",
+  )
   .argument("<name>", "Worker name")
-  .addHelpText("after", examples(["Send a test delivery", "test my-results"], ["Print the result as JSON", "test my-results --json"]))
-  .action(run((d, name: string) => commands.test(d, name)));
+  .option("--remote", "have inference.net send a real delivery through the webhook API (needs INFERENCE_API_KEY and a webhook setup created)")
+  .addHelpText(
+    "after",
+    examples(
+      ["Send a test delivery", "test my-results"],
+      ["Have inference.net send one", "test my-results --remote"],
+      ["Print the result as JSON", "test my-results --json"],
+    ),
+  )
+  .action(run((d, name: string, options: { remote?: boolean }) => commands.test(d, name, options)));
 
 program
   .command("logs")
@@ -179,7 +192,7 @@ program
   .option("--rotate-s3-keys", "replace the S3 access key; asks for it, or reads the two flags below")
   .option("--access-key-id <id>", "new S3 access key id (default: AWS_ACCESS_KEY_ID, else asks)")
   .option("--secret-access-key <key>", "new S3 secret access key (default: AWS_SECRET_ACCESS_KEY, else asks)")
-  .option("--rotate-path-secret", "new secret webhook URL; set it in the inference.net dashboard afterwards")
+  .option("--rotate-path-secret", "new secret webhook URL; updates the webhook with INFERENCE_API_KEY, else set it in the dashboard")
   .addHelpText(
     "after",
     examples(
@@ -208,7 +221,9 @@ program
 program
   .command("destroy")
   .summary("delete the Worker and its status store; S3 objects stay")
-  .description("Delete the Worker, its status KV namespace, and its local state, after you type its name. Objects in S3 stay.")
+  .description(
+    "Delete the Worker, its status KV namespace, and its local state, after you type its name. Objects in S3 stay. With INFERENCE_API_KEY, it also offers to delete the webhook setup created (--yes deletes it).",
+  )
   .argument("<name>", "Worker name")
   .addHelpText("after", examples(["Delete, after you type the name", "destroy my-results"], ["Delete without a question", "destroy my-results --yes"]))
   .action(run((d, name: string, options: { yes?: boolean }) => commands.destroy(d, name, options)));
