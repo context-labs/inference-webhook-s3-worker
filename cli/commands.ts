@@ -467,7 +467,18 @@ export async function config(deps: Deps, name: string, options: ConfigOptions) {
   await deps.store.writeSecrets(name, secrets);
   out.ok("Wrangler deployed a new version with the new settings");
   out.step("Checking the Worker with the new settings");
-  const workerStatus = await waitForWorker(deps, deployment, secrets);
+  // Secret changes deploy a new version, and the old one keeps answering for a few seconds.
+  // Probe only once the Worker reports the new S3 settings, or the probe checks the old ones.
+  const workerStatus = await waitForWorker(
+    deps,
+    deployment,
+    secrets,
+    (workerStatus) =>
+      workerStatus.bucket === s3.bucket &&
+      workerStatus.region === s3.region &&
+      workerStatus.keyPrefix === s3.keyPrefix &&
+      workerStatus.endpoint === s3.endpoint,
+  );
   checkProbe(out, name, workerStatus);
   const remote = webhookApi(deps, deployment);
   if (options.rotatePathSecret && remote) {
