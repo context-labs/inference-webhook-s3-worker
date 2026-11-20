@@ -26,6 +26,8 @@ export interface Deployment {
   url: string | null;
   statusNamespaceId: string;
   s3: S3Settings;
+  /** The webhook's id in the inference.net API (not its identifier), when setup created it through the API. */
+  apiWebhookId?: string;
   createdAt: string;
   updatedAt: string;
 }
