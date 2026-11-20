@@ -173,9 +173,11 @@ async function deployNew(
   const webhookUrl = `${deployment.url}/${secrets.pathSecret}`;
   await registerWebhook(deps, deployment, secrets, webhookUrl);
   let testDelivery = false;
-  if (secrets.webhookId && prompt) out.info("  To test it, open the webhook's menu in the dashboard, choose Test Webhook, and pick any event.");
-  if (secrets.webhookId && prompt && (await prompt.confirm("Wait here while you send a test from the dashboard?", true))) {
-    testDelivery = await waitForTestDelivery(deps, deployment, secrets, startedAt);
+  if (secrets.webhookId && prompt) {
+    out.info("  To test it, open the webhook's menu in the dashboard, choose Test Webhook, and pick any event.");
+    if (await prompt.confirm("Wait here while you send a test from the dashboard?", true)) {
+      testDelivery = await waitForTestDelivery(deps, deployment, secrets, startedAt);
+    }
   }
 
   out.heading(secrets.webhookId ? `Done. ${name} is live.` : `Deployed ${name}. One step left: store the webhook identifier.`);

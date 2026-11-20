@@ -137,9 +137,13 @@ async function handleDelivery(request: Request, env: Env, ctx: WorkerContext): P
     return fail(env, ctx, request, 502, result.message);
   }
   console.log(`Saved ${event} to ${prefix}${key}`);
-  // The dashboard's Test Webhook sends real event types with ids that start with "test-".
-  const testDelivery = event === "webhook.test" || key.includes("/test-");
-  record(env, ctx, LAST_DELIVERY_KEY, { at: new Date().toISOString(), event: event ?? "", key: `${prefix}${key}` }, testDelivery);
+  // Always record test deliveries (the dashboard's Test Webhook sends ids that start with "test-"), and
+  // the first success after an error, so `status` does not keep showing an error that is fixed.
+  const always =
+    event === "webhook.test" ||
+    key.includes("/test-") ||
+    (lastRecordedAt.get(LAST_ERROR_KEY) ?? 0) >= (lastRecordedAt.get(LAST_DELIVERY_KEY) ?? 0);
+  record(env, ctx, LAST_DELIVERY_KEY, { at: new Date().toISOString(), event: event ?? "", key: `${prefix}${key}` }, always);
   return reply(200, `${prefix}${key}`);
 }
 

@@ -247,6 +247,22 @@ describe("status route", () => {
     });
   });
 
+  it("records the first success after an error, even inside the once-a-minute window", async () => {
+    vi.resetModules();
+    const { default: freshWorker } = await import("../src/index");
+    const store = kv();
+    const pending: Promise<unknown>[] = [];
+    const recordingCtx = { waitUntil: (promise: Promise<unknown>) => pending.push(promise) };
+
+    mockS3(new Response(null, { status: 200 }), new Response(null, { status: 200 }));
+    await freshWorker.fetch(delivery(), { ...env, STATUS: store }, recordingCtx);
+    await freshWorker.fetch(delivery({ headers: { "X-Inference-Webhook-ID": "other" } }), { ...env, STATUS: store }, recordingCtx);
+    await freshWorker.fetch(delivery({ headers: { "X-Inference-Group-ID": "grp_456" } }), { ...env, STATUS: store }, recordingCtx);
+    await Promise.all(pending);
+
+    expect(JSON.parse(store.data.get("last-delivery") ?? "null")).toMatchObject({ key: "embeddings/groups/grp_456.json" });
+  });
+
   it("records a delivery to an old webhook URL, but not other wrong paths", async () => {
     const store = kv();
     const pending: Promise<unknown>[] = [];
