@@ -742,7 +742,7 @@ async function connectApi(deps: Deps): Promise<InferenceApi | null> {
     out.info("    The inference.net webhook API is not available yet, so setup walks you through the dashboard instead.");
     return null;
   }
-  out.ok("The API key can manage webhooks. Setup creates the webhook for you.");
+  out.ok("The inference.net API key works. Setup creates the webhook for you.");
   return api;
 }
 
@@ -757,8 +757,9 @@ async function remoteTestDelivery(
   deps.out.step("Asking inference.net to send a webhook.test delivery");
   const delivery = await api.test(id);
   if (!delivery.success) {
+    const answer = delivery.statusCode === 0 ? "the Worker did not answer" : `the Worker answered HTTP ${delivery.statusCode}`;
     deps.out.fail(
-      `inference.net sent it, and the Worker answered HTTP ${delivery.statusCode}${delivery.error ? `: ${delivery.error}` : ""}`,
+      `inference.net sent it, and ${answer}${delivery.error ? `: ${delivery.error}` : ""}`,
       errorFix(deployment.name, delivery.statusCode),
     );
     return false;
