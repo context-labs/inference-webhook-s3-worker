@@ -394,12 +394,27 @@ describe("config", () => {
   it("stores a new webhook identifier and a cleared prefix in one secret update", async () => {
     await seed("my-results", null);
     const { wrangler, calls } = fakeWrangler();
-    const result = await commands.config(makeDeps({ wrangler }), "my-results", { webhookId: "NewId123", prefix: "" });
+    const fetch = vi.fn(async () => Response.json(healthyStatus({ keyPrefix: "" })));
+    const result = await commands.config(makeDeps({ wrangler, fetch }), "my-results", { webhookId: "NewId123", prefix: "" });
     expect(result).toMatchObject({ ok: true, changed: ["S3_KEY_PREFIX", "INFERENCE_WEBHOOK_ID"] });
     expect(calls[0]?.args).toEqual(["secret", "bulk", "--name", "my-results"]);
     expect(JSON.parse(calls[0]?.options.input ?? "{}")).toEqual({ S3_KEY_PREFIX: null, INFERENCE_WEBHOOK_ID: "NewId123" });
     expect(await store.readSecrets("my-results")).toMatchObject({ webhookId: "NewId123" });
     expect((await store.read("my-results"))?.s3.keyPrefix).toBe("");
+  });
+
+  it("probes S3 only after the Worker reports the new settings", async () => {
+    await seed();
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(Response.json(healthyStatus()))
+      .mockResolvedValueOnce(
+        Response.json(
+          healthyStatus({ bucket: "missing", probe: { ok: false, key: "k", status: 404, message: "NoSuchBucket" } }),
+        ),
+      );
+    await expect(commands.config(makeDeps({ fetch }), "my-results", { bucket: "missing" })).rejects.toThrow(/NoSuchBucket/);
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 
   it("rotates the path secret and prints the new URL to register", async () => {
