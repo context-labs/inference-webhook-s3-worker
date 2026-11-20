@@ -296,8 +296,9 @@ describe("setup", () => {
     const { wrangler, calls } = fakeWrangler();
     const answers = ["my-results", "results", "us-east-1", "", "AKIDEXAMPLE", "AhALzdz8S"];
     const prompt: Prompter = {
+      // An empty inference.net API key skips the API and uses the dashboard.
+      password: async (message) => (message.startsWith("inference.net API key") ? "" : "s3-secret"),
       input: async () => answers.shift() ?? "",
-      password: async () => "s3-secret",
       confirm: async () => false,
       select: async <T extends string>(_message: string, choices: Array<{ value: T }>) => choices[0]!.value,
     };
@@ -443,6 +444,145 @@ describe("destroy", () => {
       ["kv", "namespace", "delete", "--namespace-id", NAMESPACE_ID, "--skip-confirmation"],
     ]);
     expect(await store.read("my-results")).toBeNull();
+  });
+});
+
+describe("inference.net webhook API", () => {
+  const API = "https://relay.inference.net/api/rest";
+  const API_KEY = "inf-test-key";
+  const WEBHOOK = {
+    id: "0c6f6a1e-6c1b-4a0e-9a53-2f1f4d0e8b7a",
+    name: "my-results",
+    identifier: "AhALzdz8S",
+    teamId: "team_123",
+    url: `${WORKER_URL}/path-secret`,
+    isDisabled: false,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+  type ApiCall = { method: string; url: string; body: unknown; auth: string | null };
+
+  /** A fetch stand-in: the API answers from `routes` ("METHOD /path"), the Worker's status URL answers healthy. */
+  function apiFetch(routes: Record<string, () => Response>) {
+    const calls: ApiCall[] = [];
+    const fetchFn = vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = String(input);
+      if (!url.startsWith(API)) {
+        return Response.json(healthyStatus({ lastDelivery: { at: "2026-01-01T00:01:00.000Z", event: "webhook.test", key: "embeddings/tests/webhook-test.json" } }));
+      }
+      const method = init.method ?? "GET";
+      calls.push({ method, url, body: init.body ? JSON.parse(String(init.body)) : undefined, auth: new Headers(init.headers).get("authorization") });
+      const route = routes[`${method} ${url.slice(API.length).split("?")[0]}`];
+      return route ? route() : Response.json({ code: "NOT_FOUND", message: "Not found" }, { status: 404 });
+    });
+    return { fetchFn, calls };
+  }
+
+  async function seedFromApi(): Promise<void> {
+    const deployment = await seed();
+    await store.write({ ...deployment, apiWebhookId: WEBHOOK.id });
+  }
+
+  it("setup creates the webhook, stores its identifier, and has inference.net send a test delivery", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 200 }));
+    const { wrangler, calls: wranglerCalls } = fakeWrangler();
+    const { fetchFn, calls } = apiFetch({
+      "GET /webhooks": () => Response.json({ webhooks: [], total: 0 }),
+      "POST /webhooks": () => Response.json({ webhook: WEBHOOK }),
+      [`POST /webhooks/${WEBHOOK.id}/test`]: () => Response.json({ success: true, statusCode: 200 }),
+    });
+    const result = await commands.setup(makeDeps({ wrangler, fetch: fetchFn, env: { INFERENCE_API_KEY: API_KEY } }), "my-results", setupFlags);
+    if (!("webhookUrl" in result)) throw new Error("expected a full setup result");
+
+    expect(result).toMatchObject({ webhookIdSet: true, webhookCreated: true, testDelivery: true });
+    expect(calls.map(({ method, url }) => `${method} ${url.slice(API.length)}`)).toEqual([
+      "GET /webhooks?limit=1",
+      "POST /webhooks",
+      `POST /webhooks/${WEBHOOK.id}/test`,
+    ]);
+    expect(calls.every(({ auth }) => auth === `Bearer ${API_KEY}`)).toBe(true);
+    expect(calls[1]?.body).toEqual({ url: result.webhookUrl, name: "my-results" });
+    expect(JSON.parse(wranglerCalls.at(-1)!.options.input ?? "{}")).toEqual({ INFERENCE_WEBHOOK_ID: WEBHOOK.identifier });
+    expect(await store.read("my-results")).toMatchObject({ apiWebhookId: WEBHOOK.id });
+    expect(await store.readSecrets("my-results")).toMatchObject({ webhookId: WEBHOOK.identifier });
+    for (const path of [store.statePath("my-results"), store.secretsPath("my-results")]) {
+      expect(await readFile(path, "utf8")).not.toContain(API_KEY);
+    }
+    expect(lines.join("\n")).not.toContain(API_KEY);
+    expect(lines.join("\n")).not.toContain("Create Webhook");
+  });
+
+  it("setup falls back to the dashboard when the API answers 404", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 200 }));
+    const { fetchFn, calls } = apiFetch({});
+    const result = await commands.setup(makeDeps({ fetch: fetchFn, env: { INFERENCE_API_KEY: API_KEY } }), "my-results", setupFlags);
+    expect(result).toMatchObject({ webhookIdSet: false, webhookCreated: false });
+    expect(calls.map(({ method }) => method)).toEqual(["GET"]);
+    expect(lines.join("\n")).toMatch(/webhook API is not available yet[\s\S]*Settings → Integrations → Create Webhook/);
+  });
+
+  it("setup stops before it creates anything when the API key is refused", async () => {
+    const { wrangler, calls } = fakeWrangler();
+    const { fetchFn } = apiFetch({ "GET /webhooks": () => Response.json({ code: "UNAUTHORIZED", message: "Invalid API key" }, { status: 401 }) });
+    const error = await commands
+      .setup(makeDeps({ wrangler, fetch: fetchFn, env: { INFERENCE_API_KEY: API_KEY } }), "my-results", setupFlags)
+      .catch((caught) => caught);
+    expect(error.message).toBe("inference.net API answered HTTP 401: Invalid API key");
+    expect(error.fix).toMatch(/write access, created by a team owner or admin/);
+    expect(calls.some(({ args }) => args[0] === "kv" || args[0] === "deploy")).toBe(false);
+  });
+
+  it("config --rotate-path-secret sets the new URL on the webhook", async () => {
+    await seedFromApi();
+    const { fetchFn, calls } = apiFetch({ [`PATCH /webhooks/${WEBHOOK.id}`]: () => Response.json({ webhook: WEBHOOK }) });
+    const result = await commands.config(makeDeps({ fetch: fetchFn, env: { INFERENCE_API_KEY: API_KEY } }), "my-results", { rotatePathSecret: true });
+    expect(calls).toMatchObject([{ method: "PATCH", body: { url: result.webhookUrl } }]);
+    expect(result.webhookUrl).not.toBe(`${WORKER_URL}/path-secret`);
+    expect(lines.join("\n")).not.toMatch(/In the inference.net dashboard/);
+  });
+
+  it("destroy --yes deletes the webhook before the Worker", async () => {
+    await seedFromApi();
+    const { wrangler } = fakeWrangler();
+    const { fetchFn, calls } = apiFetch({ [`DELETE /webhooks/${WEBHOOK.id}`]: () => Response.json({ success: true }) });
+    const result = await commands.destroy(makeDeps({ wrangler, fetch: fetchFn, env: { INFERENCE_API_KEY: API_KEY } }), "my-results", { yes: true });
+    expect(result).toMatchObject({ webhook: "deleted", worker: "deleted" });
+    expect(calls.map(({ method }) => method)).toEqual(["DELETE"]);
+  });
+
+  it("destroy without INFERENCE_API_KEY keeps the webhook and says to delete it in the dashboard", async () => {
+    await seedFromApi();
+    const { fetchFn, calls } = apiFetch({});
+    const result = await commands.destroy(makeDeps({ fetch: fetchFn }), "my-results", { yes: true });
+    expect(result).toMatchObject({ webhook: "kept" });
+    expect(calls).toEqual([]);
+    expect(lines.join("\n")).toMatch(/Delete webhook AhALzdz8S in the inference.net dashboard/);
+  });
+
+  it("status fails when the webhook sends to another URL", async () => {
+    await seedFromApi();
+    const { wrangler } = fakeWrangler({ "deployments status": { code: 0, stdout: "{}" } });
+    const { fetchFn } = apiFetch({ [`GET /webhooks/${WEBHOOK.id}`]: () => Response.json({ webhook: { ...WEBHOOK, url: `${WORKER_URL}/old` } }) });
+    const result = await commands.status(makeDeps({ wrangler, fetch: fetchFn, env: { INFERENCE_API_KEY: API_KEY } }), "my-results");
+    expect(result.ok).toBe(false);
+    expect(result.checks.find(({ check }) => check === "webhook")?.fix).toMatch(/--rotate-path-secret/);
+  });
+
+  it("test --remote has inference.net send a delivery and reports the Worker's answer", async () => {
+    await seedFromApi();
+    const { fetchFn } = apiFetch({
+      [`POST /webhooks/${WEBHOOK.id}/test`]: () => Response.json({ success: false, statusCode: 502, error: "HTTP 502" }),
+    });
+    const result = await commands.test(makeDeps({ fetch: fetchFn, env: { INFERENCE_API_KEY: API_KEY } }), "my-results", { remote: true });
+    expect(result).toEqual({ ok: false, name: "my-results", remote: true });
+    expect(lines.join("\n")).toMatch(/answered HTTP 502[\s\S]*S3 refused/);
+  });
+
+  it("test --remote without INFERENCE_API_KEY points at the dashboard", async () => {
+    await seedFromApi();
+    await expect(commands.test(makeDeps(), "my-results", { remote: true })).rejects.toMatchObject({
+      fix: expect.stringMatching(/choose Test Webhook/),
+    });
   });
 });
 
