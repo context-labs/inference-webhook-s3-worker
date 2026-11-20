@@ -49,7 +49,18 @@ async function submitGroup(paths: string[]): Promise<void> {
   const requests = await Promise.all(
     paths.map(async (path) => ({
       model: MODEL,
-      input: `data:image/jpeg;base64,${(await readFile(join(folder, path))).toString("base64")}`,
+      // One image per request: a user message with one `image_url` part.
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "image_url",
+              image_url: { url: `data:image/jpeg;base64,${(await readFile(join(folder, path))).toString("base64")}` },
+            },
+          ],
+        },
+      ],
       metadata: { custom_id: path },
     })),
   );

@@ -147,6 +147,7 @@ Each object is the webhook body exactly as inference.net sent it. The [webhook d
 
 - `state` is `Success` or `Failed`. Resubmit failed requests.
 - `request.metadata` is the metadata you sent with the request, for example a `custom_id`.
+- `request.input` has the image URL replaced by `REDACTED`, so the object does not store the image again.
 - `response.data[].embedding` is the vector.
 
 To list the vectors in a group object:
@@ -212,6 +213,21 @@ Send groups of 50, not one request per image. One webhook per image costs 50 tim
 ## Example client
 
 [`examples/submit-embeddings.ts`](examples/submit-embeddings.ts) sends every JPEG in a folder to `/v1/async/group/embeddings` in groups of 50, as base64 data URLs. Each request carries `metadata.custom_id` set to the file path, so you can match each vector to its image. The script prints one line per group with the `groupId` and its file paths.
+
+Each request holds one image as a user message with one `image_url` part. The URL must be a base64 data URL (`image/png`, `image/jpeg`, `image/gif` or `image/webp`) of at most 524,288 characters, which is about 384 KB of image:
+
+```json
+{
+  "model": "google/siglip2-base-patch16-naflex",
+  "input": [
+    {
+      "role": "user",
+      "content": [{ "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,/9j/4AAQ..." } }]
+    }
+  ],
+  "metadata": { "custom_id": "cats/0001.jpg" }
+}
+```
 
 ```sh
 export INFERENCE_API_KEY=...       # from the inference.net dashboard
