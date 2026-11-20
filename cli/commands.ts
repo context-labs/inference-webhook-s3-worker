@@ -187,6 +187,10 @@ async function deployNew(
     await deps.store.write(deployment);
     out.ok(`Created webhook ${webhook.identifier} with URL ${code(webhookUrl)}`);
     await setWebhookId(deps, deployment, secrets, webhook.identifier);
+    // wrangler returns before the new version serves every request; a test sent now can hit the old one.
+    out.step("Waiting for the Worker version with the identifier");
+    await waitForWorker(deps, deployment, secrets, (workerStatus) => workerStatus.missingSettings.length === 0);
+    out.ok("The Worker has every setting");
     testDelivery = await remoteTestDelivery(deps, { api, id: webhook.id }, deployment, secrets);
     if (!deps.env.INFERENCE_API_KEY) {
       out.info(`  The CLI did not save your API key. Set INFERENCE_API_KEY when you run status, test --remote, config, or destroy, and they manage the webhook too.`);
@@ -201,10 +205,17 @@ async function deployNew(
     }
   }
 
-  out.heading(secrets.webhookId ? `Done. ${name} is live.` : `Deployed ${name}. One step left: store the webhook identifier.`);
+  out.heading(
+    !secrets.webhookId
+      ? `Deployed ${name}. One step left: store the webhook identifier.`
+      : api && !testDelivery
+        ? `Deployed ${name} and created its webhook, but the test delivery did not arrive. Apply the fix above.`
+        : `Done. ${name} is live.`,
+  );
   out.info(`  Webhook URL:   ${code(webhookUrl)}`);
   out.info(`  Objects go to: ${s3.bucket}/${s3.keyPrefix}{groups,generations}/<id>.json`);
-  if (secrets.webhookId) out.next(cli(`status ${name}`), cli(`test ${name}`), cli(`logs ${name}`));
+  if (api && !testDelivery) out.next(cli(`status ${name}`), cli(`test ${name} --remote`));
+  else if (secrets.webhookId) out.next(cli(`status ${name}`), cli(`test ${name}`), cli(`logs ${name}`));
   else out.next(cli(`config ${name} --webhook-id <identifier>`));
   const result = {
     ok: true,
@@ -455,6 +466,9 @@ export async function config(deps: Deps, name: string, options: ConfigOptions) {
   await deps.store.write(deployment);
   await deps.store.writeSecrets(name, secrets);
   out.ok("Wrangler deployed a new version with the new settings");
+  out.step("Checking the Worker with the new settings");
+  const workerStatus = await waitForWorker(deps, deployment, secrets);
+  checkProbe(out, name, workerStatus);
   const remote = webhookApi(deps, deployment);
   if (options.rotatePathSecret && remote) {
     out.step("Updating the webhook URL on inference.net");
@@ -466,9 +480,6 @@ export async function config(deps: Deps, name: string, options: ConfigOptions) {
       `In the inference.net dashboard, set the webhook URL to ${code(webhookUrl())}`,
     );
   }
-  out.step("Checking the Worker with the new settings");
-  const workerStatus = await waitForWorker(deps, deployment, secrets);
-  checkProbe(out, name, workerStatus);
   out.next(cli(`test ${name}`));
   const result = { ok: true, name, changed: Object.keys(changes), webhookUrl: webhookUrl() };
   out.result(result);
@@ -848,14 +859,20 @@ async function fetchStatus(deps: Deps, deployment: Deployment, secrets: LocalSec
   }
 }
 
-async function waitForWorker(deps: Deps, deployment: Deployment, secrets: LocalSecrets): Promise<WorkerStatus> {
+/** Polls the Worker's status until it answers and `ready` accepts the answer. */
+async function waitForWorker(
+  deps: Deps,
+  deployment: Deployment,
+  secrets: LocalSecrets,
+  ready: (workerStatus: WorkerStatus) => boolean = () => true,
+): Promise<WorkerStatus> {
   const deadline = deps.now().getTime() + WORKER_READY_TIMEOUT_MS;
   for (;;) {
     const workerStatus = await fetchStatus(deps, deployment, secrets, true);
-    if (workerStatus) return workerStatus;
+    if (workerStatus && ready(workerStatus)) return workerStatus;
     if (deps.now().getTime() >= deadline) {
       throw new CliError(
-        `The Worker did not answer at ${deployment.url} within ${WORKER_READY_TIMEOUT_MS / 1000} seconds.`,
+        `The Worker at ${deployment.url} was not ready within ${WORKER_READY_TIMEOUT_MS / 1000} seconds.`,
         `Wait a minute, then run ${cli(`status ${deployment.name}`)}.`,
       );
     }
