@@ -196,6 +196,59 @@ describe("setup", () => {
     );
   });
 
+  it("finds the region of an Amazon S3 bucket when --region is not given", async () => {
+    const s3 = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 200 }));
+    const lookup = vi.fn(async () => new Response(null, { status: 301, headers: { "x-amz-bucket-region": "us-west-2" } }));
+    const result = await commands.setup(makeDeps({ fetch: lookup }), "my-results", { ...setupFlags, region: undefined, dryRun: true });
+    expect(lookup).toHaveBeenCalledWith("https://s3.amazonaws.com/results", expect.objectContaining({ method: "HEAD" }));
+    expect(result).toMatchObject({ s3: { region: "us-west-2" } });
+    expect((s3.mock.calls[0]?.[0] as Request).url).toBe("https://results.s3.us-west-2.amazonaws.com/embeddings/tests/setup-probe.json");
+  });
+
+  it("deploys again when Cloudflare says the just-uploaded Worker does not exist", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 200 }));
+    const { wrangler: base, calls } = fakeWrangler();
+    let deploys = 0;
+    const wrangler: Wrangler = async (args, options) => {
+      if (args[0] === "deploy" && ++deploys === 1) {
+        return { code: 1, stdout: "Uploaded my-results", stderr: "\u001b[31mThis Worker does not exist on your account. [code: 10007]\u001b[0m" };
+      }
+      return base(args, options);
+    };
+    const result = await commands.setup(makeDeps({ wrangler }), "my-results", setupFlags);
+    expect(result).toMatchObject({ ok: true, url: WORKER_URL });
+    expect(deploys).toBe(2);
+    expect(calls.at(-1)?.args.slice(0, 2)).toEqual(["secret", "bulk"]);
+  });
+
+  it("says how to start over when it fails after creating resources", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 200 }));
+    const { wrangler } = fakeWrangler({ deploy: { code: 1, stderr: "\u001b[31mAuthentication error [code: 10000]\u001b[0m" } });
+    const error = await commands.setup(makeDeps({ wrangler }), "my-results", setupFlags).catch((caught) => caught);
+    expect(error.message).toBe("wrangler deploy failed: Authentication error [code: 10000]");
+    expect(error.fix).toMatch(/destroy my-results --yes/);
+  });
+
+  it("waits for any dashboard test event, not only webhook.test", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 200 }));
+    const delivered = healthyStatus({
+      lastDelivery: { at: "2026-01-01T00:01:00.000Z", event: "slow-group.completed", key: "embeddings/groups/test-group-1.json" },
+    });
+    const prompt: Prompter = {
+      input: async () => "",
+      password: async () => "",
+      confirm: async () => true,
+      select: async <T extends string>(_message: string, choices: Array<{ value: T }>) => choices[0]!.value,
+    };
+    const result = await commands.setup(
+      makeDeps({ prompt, fetch: vi.fn(async () => Response.json(delivered)) }),
+      "my-results",
+      { ...setupFlags, webhookId: "AhALzdz8S" },
+    );
+    expect(result).toMatchObject({ testDelivery: true });
+    expect(lines.join("\n")).toContain("slow-group.completed delivery received");
+  });
+
   it("refuses a name that already exists in the Cloudflare account", async () => {
     const { wrangler, calls } = fakeWrangler({ "deployments status": { code: 0, stdout: "{}" } });
     await expect(commands.setup(makeDeps({ wrangler }), "my-results", setupFlags)).rejects.toThrow(/already exists/);
@@ -289,6 +342,21 @@ describe("status", () => {
     expect(result.checks.find(({ check }) => check === "settings")?.fix).toMatch(/--webhook-id/);
     expect(result.checks.find(({ check }) => check === "last-error")?.fix).toMatch(/--webhook-id/);
     expect(lines.join("\n")).toMatch(/needs attention/);
+  });
+
+  it("fails when deliveries fail now, such as at an old webhook URL", async () => {
+    await seed();
+    const fetchWorker = vi.fn(async () =>
+      Response.json(
+        healthyStatus({
+          lastError: { at: "2026-01-01T00:00:30.000Z", event: "slow-group.completed", status: 404, message: "Wrong path" },
+        }),
+      ),
+    );
+    const { wrangler } = fakeWrangler({ "deployments status": { code: 0, stdout: "{}" } });
+    const result = await commands.status(makeDeps({ wrangler, fetch: fetchWorker }), "my-results");
+    expect(result.ok).toBe(false);
+    expect(result.checks.find(({ check }) => check === "last-error")?.fix).toMatch(/register the webhook URL/);
   });
 
   it("reports an unknown name with the commands that help", async () => {
@@ -401,6 +469,18 @@ describe("probeS3Write", () => {
   });
 });
 
+describe("probeS3Write on an S3-compatible endpoint", () => {
+  it("does not point at AWS IAM when an R2 key cannot write", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("<Error><Code>AccessDenied</Code></Error>", { status: 403 }));
+    const error = await probeS3Write(
+      { bucket: "results", region: "auto", keyPrefix: "", endpoint: "https://account.r2.cloudflarestorage.com" },
+      { accessKeyId: "a", secretAccessKey: "b" },
+    ).catch((caught) => caught);
+    expect(error.fix).toMatch(/Object Read & Write/);
+    expect(error.fix).not.toMatch(/arn:aws/);
+  });
+});
+
 describe("Output", () => {
   it("prints only the JSON result in --json mode", () => {
     const written: string[] = [];
@@ -470,6 +550,12 @@ describe("CLI process", () => {
     expect(code).toBe(0);
     expect(output).toContain("Examples:");
     expect(output).toContain(`npm run cli -- ${name}`);
+  });
+
+  it("lists the global flags and the package manager's command form in subcommand help", () => {
+    const { output } = runCli(["status", "--help"], { npm_config_user_agent: "yarn/1.22.22 npm/? node/v24.14.1" });
+    expect(output).toContain("Usage: yarn cli status [options] <name>");
+    expect(output).toMatch(/Global Options:[\s\S]*--json[\s\S]*--yes[\s\S]*--no-color/);
   });
 
   it.each([

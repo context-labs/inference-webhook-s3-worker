@@ -27,9 +27,9 @@ Then install and start setup with your package manager:
 
 1. **Check tools.** Node.js version, wrangler, and your Cloudflare login. It offers to run `wrangler login` if you are not logged in.
 2. **Name the Worker.** The name identifies this deployment in every later command. Worker names are unique per Cloudflare account, so setup stops if the name is taken.
-3. **Connect the bucket.** Amazon S3, Cloudflare R2, or another S3-compatible service. Setup writes a test object with your key before it deploys anything, and tells you exactly what to fix if S3 refuses.
+3. **Connect the bucket.** Amazon S3, Cloudflare R2, or another S3-compatible service. For Amazon S3, setup finds the bucket's region itself. Setup writes a test object with your key before it deploys anything, and tells you exactly what to fix if S3 refuses.
 4. **Deploy.** It stores your settings as encrypted Worker secrets, deploys the Worker, and checks that the deployed Worker can write to S3.
-5. **Register the webhook.** It prints your webhook URL. In the inference.net dashboard, open **Settings** → **Integrations** → **Create Webhook**, paste the URL, and paste the webhook identifier back into setup. Then click **Test** in the dashboard; setup waits until the test delivery is in your bucket.
+5. **Register the webhook.** It prints your webhook URL. In the inference.net dashboard, open **Settings** → **Integrations** → **Create Webhook**, paste the URL, and paste the webhook identifier back into setup. Then open the webhook's menu, choose **Test Webhook**, and pick any event; setup waits until the test delivery is in your bucket.
 
 Then send requests with that webhook identifier (see [Example client](#example-client)).
 
@@ -56,9 +56,9 @@ Every command takes the Worker name you chose in setup.
 
 | Command | What it does |
 | --- | --- |
-| `npm run cli -- status <name>` | Checks that the Worker is deployed and reachable, has every setting, can write to S3, and when it last saved a delivery or rejected one. Exits non-zero when a check fails. |
+| `npm run cli -- status <name>` | Checks that the Worker is deployed and reachable, has every setting, can write to S3, and when it last saved a delivery or rejected one. Exits non-zero when a check fails, including when the latest delivery failed. A new delivery can take a minute to show up (Workers KV caches reads). |
 | `npm run cli -- test <name>` | Sends a test delivery to the Worker, the same request inference.net sends, and confirms that S3 stored it. |
-| `npm run cli -- logs <name>` | Streams live Worker logs. |
+| `npm run cli -- logs <name>` | Streams live Worker logs: one line for each saved or rejected delivery, with the event, the object key, or the reason. |
 | `npm run cli -- config <name>` | Shows the settings and the webhook URL. With flags, changes them and redeploys: `--bucket`, `--region`, `--prefix`, `--endpoint`, `--webhook-id`, `--rotate-s3-keys`, `--rotate-path-secret`. |
 | `npm run cli -- update <name>` | Deploys the code in this folder, for example after `git pull`. |
 | `npm run cli -- list` | Lists the Workers set up from this folder. |
@@ -137,7 +137,9 @@ The CLI also binds a KV namespace as `STATUS`. The Worker records its last deliv
 | `slow-group.completed` (Group API) | `<S3_KEY_PREFIX>groups/<groupId>.json` |
 | `async-embedding.completed` | `<S3_KEY_PREFIX>generations/<generationId>.json` |
 | `generation.completed` | `<S3_KEY_PREFIX>generations/<generationId>.json` |
-| `webhook.test` (dashboard **Test** button, `test` command) | `<S3_KEY_PREFIX>tests/webhook-test.json` |
+| `webhook.test` (`test` command) | `<S3_KEY_PREFIX>tests/webhook-test.json` |
+
+The dashboard's **Test Webhook** sends a sample `generation.completed`, `slow-group.completed`, or `async-embedding.completed` event with an id that starts with `test-`, so it lands at, for example, `<S3_KEY_PREFIX>groups/test-group-1795132156487.json`.
 
 `setup` and `status` also write `<S3_KEY_PREFIX>tests/setup-probe.json` and `<S3_KEY_PREFIX>tests/status-probe.json` to prove that writes work.
 
@@ -162,7 +164,7 @@ inference.net retries every response outside `200`–`299`: after 5 s, 30 s, 2 m
 | `200` | The object is in S3. The body is the object key. |
 | `400` | Unknown event type, or the id header is missing. |
 | `401` | `X-Inference-Webhook-ID` does not match `INFERENCE_WEBHOOK_ID`. |
-| `404` | The path is not `/<WEBHOOK_PATH_SECRET>`. |
+| `404` | The path is not `/<WEBHOOK_PATH_SECRET>`. When the request carries the right `X-Inference-Webhook-ID`, the webhook on inference.net has an old URL: the Worker records it, and `status` shows it. |
 | `405` | The method is not `POST`. |
 | `500` | A required setting is missing, or `S3_KEY_PREFIX` has a character that is not allowed. |
 | `502` | The S3 write failed. The Worker retries S3 `5xx` and `429` responses 3 times before it returns `502`. |
@@ -244,7 +246,7 @@ curl -X POST "http://localhost:8787/$WEBHOOK_PATH_SECRET" \
 2. Copy `.env.example` to `.env` and fill it in. Generate `WEBHOOK_PATH_SECRET` with `openssl rand -hex 32`.
 3. Run `npx wrangler deploy --secrets-file .env`. Wrangler prints the Worker URL, for example `https://inference-webhook-s3-worker.<your-subdomain>.workers.dev`.
 4. In the inference.net dashboard, open **Settings** → **Integrations** → **Create Webhook**. Set the URL to `<Worker URL>/<WEBHOOK_PATH_SECRET>`. Copy the webhook identifier, then run `npx wrangler secret put INFERENCE_WEBHOOK_ID`.
-5. Click **Test** on the webhook. Check that `<S3_KEY_PREFIX>tests/webhook-test.json` is now in your bucket.
+5. In the webhook's menu, choose **Test Webhook** → **Group Completed**. Check that `<S3_KEY_PREFIX>groups/test-group-<number>.json` is now in your bucket.
 
 This path deploys without the `STATUS` KV binding, and the CLI does not manage it.
 
