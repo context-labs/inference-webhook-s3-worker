@@ -37,9 +37,42 @@ Then install and start setup with your package manager:
 
 The CLI never saves your API key and never prints it. Set `INFERENCE_API_KEY` when you run later commands, and they manage the webhook too.
 
-Then send requests with that webhook identifier (see [Example client](#example-client)).
+To check everything first without creating anything in Cloudflare, add `--dry-run` to the setup command.
 
-To check everything first without creating anything in Cloudflare, run `npm run cli -- setup <name> --dry-run`.
+### Send images
+
+`POST https://api.inference.net/v1/async/group/embeddings` with `Authorization: Bearer $INFERENCE_API_KEY` and `webhook_id` set to the webhook identifier from setup. The response is `{"groupId": "..."}`. When every request in the group is done, inference.net sends one `slow-group.completed` webhook, and the Worker saves it as `<S3_KEY_PREFIX>groups/<groupId>.json`.
+
+```json
+{
+  "webhook_id": "AhALzdz8S",
+  "requests": [
+    {
+      "model": "google/siglip2-base-patch16-naflex",
+      "input": [
+        [{ "role": "user", "content": [{ "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,/9j/4AAQ..." } }] }],
+        [{ "role": "user", "content": [{ "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,/9j/4BBQ..." } }] }]
+      ],
+      "metadata": { "custom_ids": ["cats/0001.jpg", "cats/0002.jpg"] }
+    }
+  ]
+}
+```
+
+- A request embeds 1–50 images. Each `input` entry is one image: a list with one user message that has one `image_url` part.
+- The URL is a base64 data URL (`image/png`, `image/jpeg`, `image/gif` or `image/webp`) of at most 524,288 characters, about 384 KB of image.
+- Put your image ids in `metadata.custom_ids`, in input order. `response.data[i]` has `index` `i` and is the vector of `custom_ids[i]`.
+- The group body must stay under 32 MiB. Send 50 images per request, not one: each group is one webhook and one S3 object (see [Cost](#cost)).
+
+[`examples/submit-embeddings.ts`](examples/submit-embeddings.ts) does this for every JPEG in a folder, 50 images per request and 10 requests per group, and prints one line per group with the `groupId` and its file paths:
+
+```sh
+export INFERENCE_API_KEY=...       # from the inference.net dashboard
+export INFERENCE_WEBHOOK_ID=...    # the webhook identifier from setup
+node examples/submit-embeddings.ts ./images > groups.jsonl
+```
+
+To read the vectors back, see [Object keys](#object-keys).
 
 ### Package managers
 
@@ -219,29 +252,6 @@ Approximate list prices for one billion 768-dimension embeddings, sent in groups
 | S3 Standard storage: a vector is 10–16 KB as JSON, so 10–16 TB | about $230–370 per month |
 
 Send 50 images per request and 10 requests per group, not one request per image. One webhook per image costs 500 times more in Worker requests and S3 `PUT`s (about $5,000 more per billion images). Cloudflare R2 charges $4.50 per million writes and $0.015 per GB-month, with no egress fees.
-
-## Example client
-
-[`examples/submit-embeddings.ts`](examples/submit-embeddings.ts) sends every JPEG in a folder to `/v1/async/group/embeddings` as base64 data URLs: 50 images per request, 10 requests per group. Each request carries `metadata.custom_ids`, the file paths of its images in input order, so `response.data[i]` is the vector of `custom_ids[i]`. The script prints one line per group with the `groupId` and its file paths.
-
-`input` is a list of 1–50 images. Each image is one user message with one `image_url` part. The URL must be a base64 data URL (`image/png`, `image/jpeg`, `image/gif` or `image/webp`) of at most 524,288 characters, which is about 384 KB of image. The whole group body must stay under 32 MiB.
-
-```json
-{
-  "model": "google/siglip2-base-patch16-naflex",
-  "input": [
-    [{ "role": "user", "content": [{ "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,/9j/4AAQ..." } }] }],
-    [{ "role": "user", "content": [{ "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,/9j/4BBQ..." } }] }]
-  ],
-  "metadata": { "custom_ids": ["cats/0001.jpg", "cats/0002.jpg"] }
-}
-```
-
-```sh
-export INFERENCE_API_KEY=...       # from the inference.net dashboard
-export INFERENCE_WEBHOOK_ID=...    # the webhook identifier from setup
-node examples/submit-embeddings.ts ./images > groups.jsonl
-```
 
 ## Development
 
