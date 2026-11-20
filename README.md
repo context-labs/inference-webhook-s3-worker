@@ -10,6 +10,9 @@ A Cloudflare Worker that receives [inference.net](https://inference.net) async-i
 
 You need Node.js 22.18 or later, a Cloudflare account, and an S3 bucket with an access key that can `s3:PutObject` to it (see [IAM policy](#iam-policy)).
 
+- The Cloudflare account needs the **Workers Paid** plan. Under load, the Worker used up to 12.4 ms of CPU per request (p99), above the Free plan's 10 ms limit.
+- Clients that call the inference.net API must send their own `User-Agent` header. The API blocks some default ones, for example Python `urllib`'s, with HTTP 403 (error code 1010).
+
 Optional: an inference.net API key with write access, created by a team owner or admin. With it, setup creates the webhook for you and inference.net sends a real test delivery. Run `export INFERENCE_API_KEY=...` first, or paste the key when setup asks. Without a key, setup walks you through the dashboard.
 
 ```sh
@@ -49,6 +52,7 @@ To check everything first without creating anything in Cloudflare, add `--dry-ru
   "requests": [
     {
       "model": "google/siglip2-base-patch16-naflex",
+      "encoding_format": "base64",
       "input": [
         [{ "role": "user", "content": [{ "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,/9j/4AAQ..." } }] }],
         [{ "role": "user", "content": [{ "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,/9j/4BBQ..." } }] }]
@@ -61,6 +65,7 @@ To check everything first without creating anything in Cloudflare, add `--dry-ru
 
 - A request embeds 1–50 images. Each `input` entry is one image: a list with one user message that has one `image_url` part.
 - The URL is a base64 data URL (`image/png`, `image/jpeg`, `image/gif` or `image/webp`) of at most 524,288 characters, about 384 KB of image.
+- Set `"encoding_format": "base64"`. Each vector is then about 4 KB instead of about 10.5 KB as a float array. To decode one, base64-decode it to 3,072 bytes and read them as 768 little-endian float32 values.
 - Put your image ids in `metadata.custom_ids`, in input order. `response.data[i]` has `index` `i` and is the vector of `custom_ids[i]`.
 - The group body must stay under 32 MiB. Send 50 images per request, not one: each group is one webhook and one S3 object (see [Cost](#cost)).
 
@@ -191,7 +196,7 @@ Each object is the webhook body exactly as inference.net sent it. The [webhook d
 - `state` is `Success` or `Failed`. Resubmit failed requests.
 - `request.metadata` is the metadata you sent with the request, for example `custom_ids`.
 - `request.input` has every image URL replaced by `REDACTED`, so the object does not store the images again.
-- `response.data[i].embedding` is the vector of input image `i` (`response.data[i].index` is `i`).
+- `response.data[i].embedding` is the vector of input image `i` (`response.data[i].index` is `i`). With `"encoding_format": "base64"`, it is a base64 string of 768 little-endian float32 values.
 
 To list the vectors in a group object, one line per image:
 
@@ -249,7 +254,7 @@ Approximate list prices for one billion 768-dimension embeddings, sent in groups
 | --- | --- |
 | Cloudflare Workers Paid: $5/month with 10 million requests, then $0.30 per million | about $5 |
 | S3 `PUT` requests: $0.005 per 1,000 | about $10 |
-| S3 Standard storage: a vector is 10–16 KB as JSON, so 10–16 TB | about $230–370 per month |
+| S3 Standard storage: a vector is about 4 KB with `"encoding_format": "base64"`, so about 4 TB | about $95 per month |
 
 Send 50 images per request and 10 requests per group, not one request per image. One webhook per image costs 500 times more in Worker requests and S3 `PUT`s (about $5,000 more per billion images). Cloudflare R2 charges $4.50 per million writes and $0.015 per GB-month, with no egress fees.
 

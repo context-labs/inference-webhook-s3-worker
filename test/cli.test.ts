@@ -527,6 +527,38 @@ describe("inference.net webhook API", () => {
     expect(lines.join("\n")).not.toContain("Create Webhook");
   });
 
+  it("setup retries the test delivery while Cloudflare still serves the Worker without its settings", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 200 }));
+    const answers = [
+      { success: false, statusCode: 500, error: "HTTP 500" },
+      { success: false, statusCode: 500, error: "HTTP 500" },
+      { success: true, statusCode: 200 },
+    ];
+    const { fetchFn, calls } = apiFetch({
+      "GET /webhooks": () => Response.json({ webhooks: [], total: 0 }),
+      "POST /webhooks": () => Response.json({ webhook: WEBHOOK }),
+      [`POST /webhooks/${WEBHOOK.id}/test`]: () => Response.json(answers.shift()),
+    });
+    const sleep = vi.fn(async (_ms: number) => {});
+    const result = await commands.setup(makeDeps({ fetch: fetchFn, sleep, env: { INFERENCE_API_KEY: API_KEY } }), "my-results", setupFlags);
+    expect(result).toMatchObject({ webhookCreated: true, testDelivery: true });
+    expect(calls.filter(({ url }) => url.endsWith("/test"))).toHaveLength(3);
+    expect(sleep.mock.calls.map(([ms]) => ms)).toEqual([5_000, 10_000]);
+    expect(lines.join("\n")).toMatch(/Done\. my-results is live/);
+  });
+
+  it("setup reports the test delivery failure once the settings retries run out", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 200 }));
+    const { fetchFn, calls } = apiFetch({
+      "GET /webhooks": () => Response.json({ webhooks: [], total: 0 }),
+      "POST /webhooks": () => Response.json({ webhook: WEBHOOK }),
+      [`POST /webhooks/${WEBHOOK.id}/test`]: () => Response.json({ success: false, statusCode: 500, error: "HTTP 500" }),
+    });
+    const result = await commands.setup(makeDeps({ fetch: fetchFn, env: { INFERENCE_API_KEY: API_KEY } }), "my-results", setupFlags);
+    expect(result).toMatchObject({ testDelivery: false });
+    expect(calls.filter(({ url }) => url.endsWith("/test"))).toHaveLength(5);
+  });
+
   it("setup falls back to the dashboard when the API answers 404", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 200 }));
     const { fetchFn, calls } = apiFetch({});
