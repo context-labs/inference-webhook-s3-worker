@@ -100,7 +100,7 @@ export async function setup(deps: Deps, nameArgument: string | undefined, option
     out.info(`    2. Deploy Worker ${name} to https://${name}.<your-subdomain>.workers.dev`);
     out.info(`    3. Store ${secretNames.length} encrypted Worker secrets: ${secretNames.join(", ")}`);
     out.info(`    4. Check the deployed Worker, then walk you through registering the webhook URL on inference.net`);
-    out.next(cli(`setup ${name}`));
+    out.next(`${cli(`setup ${name}`)} with the same flags, without --dry-run`);
     const result = { ok: true, dryRun: true, name, accountId, s3, secrets: secretNames };
     out.result(result);
     return result;
