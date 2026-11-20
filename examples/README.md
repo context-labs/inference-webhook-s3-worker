@@ -10,6 +10,8 @@ set to the webhook from `setup`. The Worker saves each finished group to
 | [`python/submit.py`](python/submit.py) | Python 3.10+, standard library only. Reads a folder or an `id,path` CSV, then submits groups with a target rate, retries and resume. |
 | [`submit-embeddings.ts`](submit-embeddings.ts) | Does the same in Node.js 22.18+, with no dependencies. |
 | [`python/read_results.py`](python/read_results.py) | Yields `(custom_id, np.float32 vector)` from a group object, local or `s3://`. |
+| [`typescript/embed-minimal.ts`](typescript/embed-minimal.ts) | The smallest correct Node.js 22.18+ client: one group of up to 2,500 images, no retries. |
+| [`typescript/read-results.ts`](typescript/read-results.ts) | Yields `[customId, Float32Array]` from a local group object. Download it with `aws s3 cp` first. |
 
 inference.net gives you the model id for your account. Set it in `INFERENCE_MODEL`.
 
@@ -42,6 +44,25 @@ failed = []
 for custom_id, vec in iter_group(load("s3://my-bucket/embeddings/groups/abc.json"), failed):
     ...  # vec: 1-D np.float32, L2-normalized
 # `failed` now holds the custom ids of failed requests. Resubmit them.
+```
+
+### TypeScript quick start
+
+Node.js 22.18+ runs the `.ts` files directly. They need no dependencies.
+
+```sh
+node examples/typescript/embed-minimal.ts a.jpg b.jpg   # prints {"groupId":"...","groupSize":1}
+aws s3 cp s3://my-bucket/embeddings/groups/<groupId>.json .
+node examples/typescript/read-results.ts <groupId>.json
+```
+
+```ts
+import { iterGroup, load } from "./examples/typescript/read-results.ts";
+const failed: string[] = [];
+for (const [customId, vec] of iterGroup(load("abc.json"), failed)) {
+  // vec: Float32Array, L2-normalized
+}
+// `failed` now holds the custom ids of failed requests. Resubmit them.
 ```
 
 ## Request shape
