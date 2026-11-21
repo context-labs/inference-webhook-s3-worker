@@ -88,8 +88,8 @@ for (const [customId, vec] of iterGroup(load("abc.json"), failed)) {
 
 - **Set your own `User-Agent`.** The edge rejects some default user agents with `403`. `embed-minimal.ts` sends `embeddings-minimal/1.0`.
 - **Limits:** at most 50 images per request, 50 requests per group, and 32 MiB per POST.
-- **Base64 vectors are little-endian float32.** Use `decode()`, or a `DataView` with `littleEndian = true`.
+- **Base64 vectors are little-endian float32**, or float16 when the request had `"embed_dtype": "float16"`. `iterGroup()` reads that from each stored request; `decode(embedding, "float16")` does it by hand.
 - **One failed request does not fail the group.** Its images come back in `failed`. The rest still land.
-- **Key by id, not position.** A retried POST can create a second group with the same images. Key results by `customId`.
+- **Key by id, not position.** `embed-minimal.ts` sends an `Idempotency-Key` (the SHA-256 of the body), so running it again on the same files within 1 hour returns the first group. A duplicate group is still possible, so key results by `customId`.
 
 More detail on limits, batching, and retries: [`../README.md`](../README.md).

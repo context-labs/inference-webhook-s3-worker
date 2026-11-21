@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 export interface Generation {
   id: string;
   state: "Success" | "Failed";
-  request: { metadata: { custom_ids: string[] } };
+  request: { metadata: { custom_ids: string[] }; embed_dtype?: "float32" | "float16" };
   response?: { data: { index: number; embedding: string | number[] }[] };
 }
 export interface GroupObject { data: { generations: Generation[] } }
@@ -26,13 +26,29 @@ export function load(path: string): GroupObject {
   return JSON.parse(readFileSync(path, "utf8")) as GroupObject;
 }
 
-/** base64 = little-endian float32 bytes; an array = encoding_format "float". */
-export function decode(embedding: string | number[]): Float32Array {
+/** IEEE 754 binary16 to a number (Node 22 has no DataView.getFloat16). */
+function half(bits: number): number {
+  const sign = bits & 0x8000 ? -1 : 1;
+  const exponent = (bits >> 10) & 0x1f;
+  const fraction = bits & 0x3ff;
+  if (exponent === 0) return sign * fraction * 2 ** -24;
+  if (exponent === 31) return fraction ? NaN : sign * Infinity;
+  return sign * (1 + fraction / 1024) * 2 ** (exponent - 15);
+}
+
+/**
+ * base64 = little-endian float32 bytes, or float16 with embedDtype "float16"; an array =
+ * encoding_format "float". Always returns a Float32Array.
+ */
+export function decode(embedding: string | number[], embedDtype: "float32" | "float16" = "float32"): Float32Array {
   if (Array.isArray(embedding)) return Float32Array.from(embedding);
+  const size = embedDtype === "float16" ? 2 : 4;
   const bytes = Buffer.from(embedding, "base64");
-  if (bytes.length === 0 || bytes.length % 4 !== 0) throw new Error(`bad embedding: ${bytes.length} bytes`);
+  if (bytes.length === 0 || bytes.length % size !== 0) throw new Error(`bad embedding: ${bytes.length} bytes`);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
-  return Float32Array.from({ length: bytes.length / 4 }, (_, i) => view.getFloat32(i * 4, true));
+  return Float32Array.from({ length: bytes.length / size }, (_, i) =>
+    size === 2 ? half(view.getUint16(i * 2, true)) : view.getFloat32(i * 4, true),
+  );
 }
 
 /**
@@ -51,7 +67,7 @@ export function* iterGroup(doc: GroupObject, failed: string[] = []): Generator<[
     if (gen.response.data.length !== ids.length) {
       throw new Error(`generation ${gen.id}: ${gen.response.data.length} vectors for ${ids.length} ids`);
     }
-    for (const item of gen.response.data) yield [ids[item.index]!, decode(item.embedding)];
+    for (const item of gen.response.data) yield [ids[item.index]!, decode(item.embedding, gen.request.embed_dtype)];
   }
 }
 
