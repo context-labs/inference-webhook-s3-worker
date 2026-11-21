@@ -1,6 +1,7 @@
 """Submit images to inference.net async image embeddings, in groups.
 
-Each group = up to 10 requests x 50 images = 500 images, one webhook, one S3 object.
+Each group = up to 10 requests x 50 images = 500 images, one webhook, one S3 object
+(with --presign-hours, use --requests-per-group 50: 2,500 images, since URLs are small).
 Every submitted group is printed and appended to a JSONL log; rerunning with the same log
 skips images that are already submitted, so an interrupted run resumes.
 
@@ -9,6 +10,8 @@ Usage (Python 3.10+, stdlib only; boto3 for s3:// paths and --reconcile):
   python submit.py ./images                   # every .jpg/.jpeg/.png/.webp under a folder; id = relative path
   python submit.py manifest.csv               # CSV with header "id,path"; path may be s3://bucket/key (needs boto3)
   python submit.py manifest.csv --rate 2000 --concurrency 16 --log submitted.jsonl
+  python submit.py manifest.csv --presign-hours 72 --requests-per-group 50   # s3:// paths sent as presigned URLs
+  python submit.py ./images --embed-dtype float16                            # half-size vectors
   python submit.py manifest.csv --reconcile s3://my-bucket/embeddings/ --dry-run   # count ids with no result in S3
   python submit.py manifest.csv --reconcile s3://my-bucket/embeddings/             # resubmit only those
 
@@ -18,6 +21,7 @@ Exit code 1 if any group or image failed; rerun the same command to retry only t
 import argparse
 import base64
 import csv
+import hashlib
 import json
 import os
 import random
@@ -33,6 +37,7 @@ API_URL = os.environ.get("INFERENCE_API_URL", "https://api.inference.net") + "/v
 # inference.net gives you the model id for your account.
 MODEL = os.environ.get("INFERENCE_MODEL", "your-embedding-model-id")
 MAX_DATA_URI_CHARS = 512 * 1024  # per image; larger images are rejected by the API
+MAX_URL_CHARS = 4096
 MAX_ATTEMPTS = 8
 MIME = {".jpg": "jpeg", ".jpeg": "jpeg", ".png": "png", ".webp": "webp", ".gif": "gif"}
 
@@ -53,33 +58,57 @@ def list_images(source: str) -> list[tuple[str, str]]:
 _s3 = threading.local()
 
 
+def s3_client():
+    if not hasattr(_s3, "client"):
+        import boto3  # pip install boto3; one client per thread
+        from botocore.config import Config
+
+        # SigV4: boto3 still presigns with SigV2 in us-east-1 unless told otherwise.
+        _s3.client = boto3.client("s3", config=Config(signature_version="s3v4"))
+    return _s3.client
+
+
 def read_image(path: str) -> bytes:
     """S3 HOOK: replace or extend this to read from your own storage."""
     if path.startswith("s3://"):
-        if not hasattr(_s3, "client"):
-            import boto3  # pip install boto3; one client per thread
-
-            _s3.client = boto3.client("s3")
         bucket, key = path[5:].split("/", 1)
-        return _s3.client.get_object(Bucket=bucket, Key=key)["Body"].read()
+        return s3_client().get_object(Bucket=bucket, Key=key)["Body"].read()
     return Path(path).read_bytes()
 
 
-def data_uri(path: str) -> str:
+def image_url(path: str, presign_seconds: int) -> str:
+    """The image_url.url for one image: an https:// path as is, an s3:// path presigned when
+    presign_seconds is set (signed locally, no request to S3), anything else as a data URL."""
+    if path.startswith("https://"):
+        return path
+    if path.startswith("s3://") and presign_seconds:
+        bucket, key = path[5:].split("/", 1)
+        params = {"Bucket": bucket, "Key": key}
+        return s3_client().generate_presigned_url("get_object", Params=params, ExpiresIn=presign_seconds)
     mime = MIME.get(Path(path).suffix.lower(), "jpeg")
     return f"data:image/{mime};base64,{base64.b64encode(read_image(path)).decode()}"
 
 
-def post_group(body: bytes, api_key: str) -> str:
-    """POST one group; retry 429/5xx/network errors with backoff + jitter. Returns groupId.
+def idempotency_key(body: bytes, salt: str) -> str:
+    """Same body and salt, same key: inference.net answers a repeat within 1 hour with the
+    group it already accepted. A key from the body, not only the ids, never collides with a
+    resend whose presigned URLs were signed again (that would be HTTP 422)."""
+    return hashlib.sha256(salt.encode() + body).hexdigest()
 
-    Not idempotent: if a POST times out after the server accepted it, the retry
-    creates a second group with the same images. Key results by custom_id.
+
+def post_group(body: bytes, api_key: str, salt: str) -> str:
+    """POST one group; retry 409/429/5xx/network errors with backoff + jitter. Returns groupId.
+
+    Every attempt sends the same body and Idempotency-Key, so a retry after a timeout returns
+    the first group instead of making a second one. If inference.net cannot check the key, it
+    still accepts the group, so a duplicate stays possible: key results by custom_id.
     """
+    key = idempotency_key(body, salt)
     for attempt in range(1, MAX_ATTEMPTS + 1):
         req = urllib.request.Request(API_URL, data=body, method="POST", headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "Idempotency-Key": key,
             "User-Agent": "embeddings-submit/1.0",  # some default user agents (e.g. Python urllib) get 403
         })
         retry_after = None
@@ -88,7 +117,8 @@ def post_group(body: bytes, api_key: str) -> str:
                 return json.load(resp)["groupId"]
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")[:500]
-            if e.code != 429 and e.code < 500:
+            # 409: the first POST with this key is still running.
+            if e.code not in (409, 429) and e.code < 500:
                 raise RuntimeError(f"HTTP {e.code} (not retried): {detail}") from None
             error = f"HTTP {e.code}: {detail}"
             retry_after = e.headers.get("Retry-After")
@@ -177,7 +207,16 @@ def main() -> None:
     ap.add_argument("--get-all", action="store_true",
                     help="with --reconcile: also read groups without a failures/ marker (saved by an older Worker)")
     ap.add_argument("--dry-run", action="store_true", help="print what would be submitted, submit nothing")
+    ap.add_argument("--presign-hours", type=float, default=0,
+                    help="send s3:// images as presigned GET URLs valid this long, 72-168, instead of data URLs")
+    ap.add_argument("--embed-dtype", choices=["float32", "float16"], default="float32",
+                    help="float16 halves each vector (default float32)")
     args = ap.parse_args()
+    if args.presign_hours and not 72 <= args.presign_hours <= 168:
+        ap.error("--presign-hours must be 72-168: a request can wait up to 72 h, and S3 signs for at most 7 days")
+    presign_seconds = int(args.presign_hours * 3600)
+    # A new salt for each reconcile run, so its resubmits never match a key used before.
+    salt = f"reconcile-{time.time_ns()}" if args.reconcile else ""
 
     entries = []
     if os.path.exists(args.log):
@@ -211,23 +250,27 @@ def main() -> None:
             chunk, uris = [], []
             for custom_id, path in group[i : i + args.images_per_request]:
                 try:
-                    uri = data_uri(path)
+                    uri = image_url(path, presign_seconds)
                 except Exception as e:  # unreadable file or object: report, keep going
                     print(f"SKIP {custom_id}: {e}", file=sys.stderr)
                     continue
-                if len(uri) > MAX_DATA_URI_CHARS:
-                    print(f"SKIP {custom_id}: {len(uri)} chars > {MAX_DATA_URI_CHARS}; downscale it", file=sys.stderr)
+                limit = MAX_DATA_URI_CHARS if uri.startswith("data:") else MAX_URL_CHARS
+                if len(uri) > limit:
+                    print(f"SKIP {custom_id}: {len(uri)} chars > {limit}; downscale it or shorten the URL", file=sys.stderr)
                     continue
                 chunk.append(custom_id)
                 uris.append(uri)
             if not chunk:
                 continue
-            requests.append({
+            request = {
                 "model": MODEL,
                 "encoding_format": "base64",
                 "input": [[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": u}}]}] for u in uris],
                 "metadata": {"custom_ids": chunk},  # response.data[i] is custom_ids[i]
-            })
+            }
+            if args.embed_dtype == "float16":
+                request["embed_dtype"] = "float16"
+            requests.append(request)
             ids += chunk
         with log_lock:
             failures += len(group) - len(ids)
@@ -235,7 +278,7 @@ def main() -> None:
             return
         body = json.dumps({"webhook_id": webhook_id, "requests": requests}).encode()
         try:
-            group_id = post_group(body, api_key)
+            group_id = post_group(body, api_key, salt)
         except Exception as e:
             print(f"FAILED group of {len(ids)} starting {ids[0]}: {e}", file=sys.stderr)
             with log_lock:

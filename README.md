@@ -83,6 +83,7 @@ Send a group to `POST https://api.inference.net/v1/async/group/embeddings`. Set 
 curl https://api.inference.net/v1/async/group/embeddings \
   -H "Authorization: Bearer $INFERENCE_API_KEY" \
   -H "Content-Type: application/json" \
+  -H "Idempotency-Key: 9f86d081884c7d65…" \
   -H "User-Agent: my-embedder/1.0" \
   -d '{
     "webhook_id": "AhALzdz8S",
@@ -105,6 +106,7 @@ When every request in the group is done, inference.net sends one `slow-group.com
 - Put your own ids in `metadata.custom_ids`, in input order.
 - Set `"encoding_format": "base64"`. A vector is then about 4 KB instead of about 10.5 KB as a float array.
 - Send your own `User-Agent`. The API blocks some default ones, for example Python `urllib`'s, with HTTP 403 (error code 1010).
+- Set `Idempotency-Key` to the SHA-256 of the body. A retry with the same key and body within 1 hour returns the first `groupId` instead of making a second group.
 
 Full clients in Python, Node.js and curl are in [`examples/`](examples/).
 
@@ -112,7 +114,7 @@ Full clients in Python, Node.js and curl are in [`examples/`](examples/).
 <summary><b>Limits</b></summary>
 
 - A request embeds 1–50 images.
-- Each image is a base64 data URL (`image/png`, `image/jpeg`, `image/gif` or `image/webp`) of at most 524,288 characters, about 384 KB of image.
+- Each image is a base64 data URL (`image/png`, `image/jpeg`, `image/gif` or `image/webp`) of at most 524,288 characters, about 384 KB of image, or an `https://` URL such as a presigned S3 GET. See [Image URLs](examples/README.md#image-urls).
 - The group body must stay under 32 MiB.
 - Send 50 images per request, not one. Each group is one webhook and one S3 object. See Cost under [Reference](#reference).
 
@@ -154,7 +156,7 @@ This shows only the fields you need. The [webhook docs](https://inference.net/do
 jq -c '.data.generations[] | .request.metadata.custom_ids as $ids | .state as $state | .response.data[]? | {custom_id: $ids[.index], state: $state, embedding}' grp_abc.json
 ```
 
-An `embedding` is a base64 string of little-endian float32 values. For a 768-dimension model that is 3,072 bytes. To decode one:
+An `embedding` is a base64 string of little-endian float32 values. For a 768-dimension model that is 3,072 bytes. With `"embed_dtype": "float16"` in the request, the values are float16 and half the size ([details](examples/README.md#half-size-vectors-float16)). To decode a float32 one:
 
 ```sh
 python3 -c 'import base64, struct, sys; print((lambda b: struct.unpack(f"<{len(b)//4}f", b))(base64.b64decode(sys.argv[1])))' "$EMBEDDING"
@@ -343,6 +345,8 @@ Approximate list prices for one billion 768-dimension embeddings, sent in groups
 | S3 Standard storage: a vector is about 4 KB with `"encoding_format": "base64"`, so about 4 TB | about $95 per month |
 
 Send 50 images per request and 10 requests per group, not one request per image. One webhook per image costs 500 times more in Worker requests and S3 `PUT`s (about $5,000 more per billion images). Cloudflare R2 charges $4.50 per million writes and $0.015 per GB-month, with no egress fees.
+
+With [image URLs](examples/README.md#image-urls), send 50 requests per group (2,500 images): Worker requests and `PUT`s drop to a fifth. `"embed_dtype": "float16"` halves storage.
 
 </details>
 

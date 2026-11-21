@@ -22,10 +22,16 @@ body() {
   printf ']}}]}'
 }
 
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+body "$@" > "$tmp"
+
 # Prints {"groupId":"...","groupSize":1}. The webhook arrives when the group is done.
-body "$@" | curl -sS --fail-with-body https://api.inference.net/v1/async/group/embeddings \
+# The same files sent again within 1 hour return the same group: the key is a hash of the body.
+curl -sS --fail-with-body https://api.inference.net/v1/async/group/embeddings \
   -H "Authorization: Bearer $INFERENCE_API_KEY" \
   -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $(shasum -a 256 < "$tmp" | cut -d' ' -f1)" \
   -H "User-Agent: embeddings-submit/1.0" \
-  --data-binary @-
+  --data-binary @"$tmp"
 echo

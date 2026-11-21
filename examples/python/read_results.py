@@ -6,7 +6,7 @@ Usage:
 
 As a library:
   for custom_id, vec in iter_group(load("groups/abc.json")):
-      ...  # vec is a 1-D np.float32 array
+      ...  # vec is a 1-D np.float32 array, also for embed_dtype "float16"
 
 Requires: pip install -r requirements.txt (boto3 only for s3:// paths).
 """
@@ -30,10 +30,12 @@ def load(path: str) -> dict:
         return json.load(f)
 
 
-def decode(embedding: str | list[float]) -> np.ndarray:
-    """base64 = little-endian float32 bytes; a list = encoding_format "float"."""
+def decode(embedding: str | list[float], embed_dtype: str = "float32") -> np.ndarray:
+    """base64 = little-endian float32 bytes, or float16 with embed_dtype "float16" (returned
+    as float32); a list = encoding_format "float"."""
     if isinstance(embedding, str):
-        vec = np.frombuffer(base64.b64decode(embedding), dtype="<f4")
+        vec = np.frombuffer(base64.b64decode(embedding), dtype="<f2" if embed_dtype == "float16" else "<f4")
+        vec = vec.astype(np.float32)
     else:
         vec = np.asarray(embedding, dtype=np.float32)
     if vec.ndim != 1 or vec.size == 0:
@@ -48,9 +50,11 @@ def iter_group(doc: dict, failed: list[str] | None = None) -> Iterator[tuple[str
     response.data[i] (by .index) to an id. Generations are NOT in submission
     order, so never map by position across generations.
     Custom ids of failed requests are appended to `failed`: resubmit those.
+    The request is stored with each generation, so its embed_dtype says how to decode.
     """
     for gen in doc["data"]["generations"]:
         ids = gen["request"]["metadata"]["custom_ids"]
+        embed_dtype = gen["request"].get("embed_dtype", "float32")
         if gen["state"] != "Success":
             if failed is not None:
                 failed.extend(ids)
@@ -59,7 +63,7 @@ def iter_group(doc: dict, failed: list[str] | None = None) -> Iterator[tuple[str
         if len(data) != len(ids):
             raise ValueError(f"generation {gen['id']}: {len(data)} vectors for {len(ids)} ids")
         for item in data:
-            yield ids[item["index"]], decode(item["embedding"])
+            yield ids[item["index"]], decode(item["embedding"], embed_dtype)
 
 
 def main() -> None:

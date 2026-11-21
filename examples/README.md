@@ -93,6 +93,52 @@ Python `urllib`'s, with `403 error code: 1010`.
 - `metadata.custom_ids` holds your ids in input order. `response.data[i]` (`index` = `i`) is the vector of `custom_ids[i]`.
 - The response is `{"groupId": "...", "groupSize": <number of requests>}`.
 - With `encoding_format: "base64"`, each vector is base64 of little-endian float32 values. It is about 3 times smaller than `"float"`.
+- Add `"embed_dtype": "float16"` next to `encoding_format` to get [half-size vectors](#half-size-vectors-float16).
+- An image can also be an `https://` URL that inference.net fetches. See [Image URLs](#image-urls).
+- Send an `Idempotency-Key` header, so a retried POST does not make a second group. See [Retries](#retries).
+
+## Image URLs
+
+Instead of a data URL, `image_url.url` can be an `https://` URL, for example a presigned S3 GET.
+The body then stays small, so a group can hold 50 requests of 50 images.
+
+```sh
+python examples/python/submit.py manifest.csv --presign-hours 72 --requests-per-group 50
+```
+
+- `--presign-hours` sends each `s3://` path in the manifest as a presigned GET URL, signed
+  locally by boto3 with SigV4 for the region in `AWS_REGION` or your profile. That must be the
+  region of the images' bucket. A manifest path that starts with `https://` is always sent as
+  it is, also by `submit-embeddings.ts`.
+- Presign for at least 72 hours: a request can wait up to 72 hours before it runs. S3 allows
+  at most 7 days (168 hours), and only for URLs signed with an IAM user's access key. A URL
+  signed with temporary credentials (SSO, an assumed role, STS) stops working when that
+  session ends.
+- URL rules, checked at submit (`400` otherwise): `https` only, a public host name (no IP
+  address, no `localhost`), no `user:password@`, at most 4,096 characters.
+- inference.net fetches each URL when the request runs. The image must be PNG, JPEG, GIF or
+  WebP and at most 384 KiB. `408`, `429` and `5xx` answers are retried twice.
+- A URL that cannot be fetched fails only its own request: `state: "Failed"`, and
+  `stateMessage` says why, for example `the server answered HTTP 403 (an expired presigned URL
+  answers 403)`. [Reconcile](#reconcile-with-s3) resubmits those ids with new URLs.
+- S3 serves at least 5,500 GET requests per second per prefix, and answers `503 SlowDown`
+  while it scales up. Above that rate, spread the images across prefixes, for example keys
+  that start with a hash.
+- The stored request and the webhook show every image as `"REDACTED"`, so your URLs are not
+  saved with the results.
+
+## Half-size vectors (float16)
+
+Add `"embed_dtype": "float16"` to each request (`--embed-dtype float16`, or
+`EMBED_DTYPE=float16` for `submit-embeddings.ts`). Each base64 vector is then little-endian
+float16: 1,536 bytes and 2,048 characters for 768 dimensions, instead of 3,072 bytes and 4,096
+characters. Webhooks and S3 objects are about half the size.
+
+- Cosine similarity with the float32 vector is above 0.9999999 for normalized vectors.
+- The default is `"float32"`. `encoding_format: "float"` ignores `embed_dtype`.
+- The stored request keeps `embed_dtype`, so `read_results.py` and `read-results.ts` decode each
+  generation the right way and always return float32 vectors. In NumPy:
+  `np.frombuffer(base64.b64decode(s), dtype="<f2")`.
 
 ## Limits
 
@@ -100,7 +146,7 @@ Python `urllib`'s, with `403 error code: 1010`.
 | --- | --- |
 | Group (one POST) | 1–50 requests, and a body of at most 32 MiB |
 | Request | 1–50 images |
-| Image | A data URI of at most 524,288 characters (about 384 KB of image): `image/jpeg`, `png`, `gif` or `webp` |
+| Image | A data URI of at most 524,288 characters (about 384 KB of image): `image/jpeg`, `png`, `gif` or `webp`. Or an `https://` URL of at most 4,096 characters, to an image of at most 384 KiB. |
 | Rate limit | Your team's requests per minute. **One group POST counts as 1 request**, however many images it holds. |
 
 Errors:
@@ -108,16 +154,21 @@ Errors:
 | Status | Cause |
 | --- | --- |
 | `400` | Bad input. The body names the field, for example `requests.0.input.0.0.content.0.image_url.url`. |
+| `409` | A POST with the same `Idempotency-Key` is still running. Retry with the same key and body. |
 | `401` | Bad API key. |
 | `403` | The edge blocked a default user agent. |
 | `413` | The body is larger than 32 MiB. |
+| `422` | The `Idempotency-Key` was already used with a different body in the last hour. |
 | `429` | Rate limited. |
 
 ## Batching
 
-Send **10 requests of 50 images each: 500 images per group.**
+Send **50 requests of 50 images each (2,500 images per group) with image URLs.** With data URLs,
+send as many requests as fit in 32 MiB: about 35 requests of 50 images at 18 KB per image, and
+10 (the submitters' default) for images of up to about 60 KB.
 
 - 500 images of about 13.5 KB are about 9 MB of JSON. 500 images of 27 KB are about 18 MB. Both are under 32 MiB.
+- 2,500 presigned URLs of about 1,900 characters are about 5 MB.
 - Each group makes one webhook and one S3 object, so larger groups cost less on the Worker and in S3.
 - A failed request fails only its own images. The other requests in the group still land.
 
@@ -138,10 +189,19 @@ Send **10 requests of 50 images each: 500 images per group.**
 
 The submitters already do this:
 
-- They retry `429`, `5xx`, network errors and timeouts with exponential backoff and full jitter (a random wait of 0–2^attempt s, capped at 60 s), up to 8 attempts. A `Retry-After` header overrides the backoff.
+- They retry `409`, `429`, `5xx`, network errors and timeouts with exponential backoff and full jitter (a random wait of 0–2^attempt s, capped at 60 s), up to 8 attempts. A `Retry-After` header overrides the backoff.
 - They do not retry other `4xx` responses. Fix the input, for example downscale the image, and rerun.
 - When a POST fails, they resend the **whole group**. The API accepts all of a group or none of it.
-- **The POST is not idempotent.** If the connection drops after the server accepted the group, the retry creates a second group with the same images, and you get two result objects. Key results by `custom_id` (last write wins). Never count result objects.
+- Each POST carries `Idempotency-Key: <SHA-256 of the body>`, and every retry sends the same body
+  and key. If the connection drops after the server accepted the group, the retry gets the same
+  `groupId` back (with `Idempotent-Replayed: true`), not a second group. A rerun after a crash
+  builds the same body for the same files, so it also gets the first group back. Presigned URLs
+  are signed again on a rerun, so there the rerun makes a new group.
+- The key works for 1 hour after the first success. inference.net still accepts a group when it
+  cannot check the key, so a duplicate is rare but possible. Key results by `custom_id` (last
+  write wins). Never count result objects.
+- [Reconcile](#reconcile-with-s3) adds a new salt to the key on each run, so a resubmit is
+  never answered with the lost group it replaces.
 - They skip an image that is over the size limit with a `SKIP` line, so it does not fail its whole group.
 
 ### Resume

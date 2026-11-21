@@ -7,6 +7,7 @@
  *   export INFERENCE_API_KEY=... INFERENCE_WEBHOOK_ID=... INFERENCE_MODEL=...
  *   node examples/typescript/embed-minimal.ts a.jpg b.png ...   # custom id = the path you pass
  */
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { extname } from "node:path";
 
@@ -41,10 +42,17 @@ for (let i = 0; i < files.length; i += IMAGES_PER_REQUEST) {
   });
 }
 
+const body = JSON.stringify({ webhook_id: webhookId, requests });
 const response = await fetch(`${process.env.INFERENCE_API_URL ?? "https://api.inference.net"}/v1/async/group/embeddings`, {
   method: "POST",
-  headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", "User-Agent": "embeddings-minimal/1.0" },
-  body: JSON.stringify({ webhook_id: webhookId, requests }),
+  headers: {
+    Authorization: `Bearer ${apiKey}`,
+    "Content-Type": "application/json",
+    // Running this again on the same files within 1 hour returns the same group, not a second one.
+    "Idempotency-Key": createHash("sha256").update(body).digest("hex"),
+    "User-Agent": "embeddings-minimal/1.0",
+  },
+  body,
 });
 if (!response.ok) throw new Error(`HTTP ${response.status}: ${(await response.text()).slice(0, 500)}`);
 console.log(JSON.stringify((await response.json()) as GroupResponse));

@@ -9,9 +9,12 @@
  *   node examples/submit-embeddings.ts ./images              # every .jpg/.jpeg/.png/.webp under a folder; id = relative path
  *   node examples/submit-embeddings.ts manifest.csv          # CSV with header "id,path" (no quoted fields)
  *   RATE=2000 CONCURRENCY=16 LOG=submitted.jsonl node examples/submit-embeddings.ts manifest.csv
+ *   EMBED_DTYPE=float16 node examples/submit-embeddings.ts ./images  # half-size vectors
+ * A manifest path that starts with https:// is sent as an image URL, not read and encoded.
  *
  * Exit code 1 if any group or image failed; rerun the same command to retry only those.
  */
+import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { extname, join } from "node:path";
@@ -20,6 +23,7 @@ const API_URL = `${process.env.INFERENCE_API_URL ?? "https://api.inference.net"}
 // inference.net gives you the model id for your account.
 const MODEL = process.env.INFERENCE_MODEL ?? "your-embedding-model-id";
 const MAX_DATA_URI_CHARS = 512 * 1024; // per image; larger images are rejected by the API
+const MAX_URL_CHARS = 4096;
 const MAX_ATTEMPTS = 8;
 const MIME: Record<string, string> = { ".jpg": "jpeg", ".jpeg": "jpeg", ".png": "png", ".webp": "webp", ".gif": "gif" };
 
@@ -35,6 +39,7 @@ const RATE = Number(process.env.RATE ?? 1000); // target images/s
 const CONCURRENCY = Number(process.env.CONCURRENCY ?? 8); // groups in flight
 const IMAGES_PER_REQUEST = Number(process.env.IMAGES_PER_REQUEST ?? 50); // 1-50
 const REQUESTS_PER_GROUP = Number(process.env.REQUESTS_PER_GROUP ?? 10); // 1-50
+const EMBED_DTYPE = process.env.EMBED_DTYPE ?? "float32"; // float16 halves each vector
 
 type Item = { id: string; path: string };
 
@@ -62,11 +67,13 @@ async function readImage(path: string): Promise<Buffer> {
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * POST one group; retry 429/5xx/network errors with backoff + jitter. Returns groupId.
- * Not idempotent: if a POST times out after the server accepted it, the retry
- * creates a second group with the same images. Key results by custom_id.
+ * POST one group; retry 409/429/5xx/network errors with backoff + jitter. Returns groupId.
+ * Every attempt sends the same body and Idempotency-Key (a hash of the body), so a retry after
+ * a timeout returns the first group instead of making a second one. If inference.net cannot
+ * check the key, it still accepts the group, so a duplicate stays possible: key results by custom_id.
  */
 async function postGroup(body: string): Promise<string> {
+  const idempotencyKey = createHash("sha256").update(body).digest("hex");
   for (let attempt = 1; ; attempt++) {
     let error: string;
     let retryAfter: string | null = null;
@@ -76,6 +83,7 @@ async function postGroup(body: string): Promise<string> {
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
+          "Idempotency-Key": idempotencyKey,
           "User-Agent": "embeddings-submit/1.0", // some default user agents (e.g. Python urllib) get 403
         },
         body,
@@ -83,7 +91,8 @@ async function postGroup(body: string): Promise<string> {
       });
       if (response.ok) return ((await response.json()) as { groupId: string }).groupId;
       const detail = (await response.text()).slice(0, 500);
-      if (response.status !== 429 && response.status < 500) {
+      // 409: the first POST with this key is still running.
+      if (response.status !== 409 && response.status !== 429 && response.status < 500) {
         throw new Error(`HTTP ${response.status} (not retried): ${detail}`, { cause: "fatal" });
       }
       error = `HTTP ${response.status}: ${detail}`;
@@ -132,13 +141,16 @@ async function submitGroup(group: Item[]): Promise<void> {
     for (const { id, path } of group.slice(i, i + IMAGES_PER_REQUEST)) {
       let uri: string;
       try {
-        uri = `data:image/${MIME[extname(path).toLowerCase()] ?? "jpeg"};base64,${(await readImage(path)).toString("base64")}`;
+        uri = path.startsWith("https://")
+          ? path
+          : `data:image/${MIME[extname(path).toLowerCase()] ?? "jpeg"};base64,${(await readImage(path)).toString("base64")}`;
       } catch (e) {
         console.error(`SKIP ${id}: ${e instanceof Error ? e.message : String(e)}`);
         continue;
       }
-      if (uri.length > MAX_DATA_URI_CHARS) {
-        console.error(`SKIP ${id}: ${uri.length} chars > ${MAX_DATA_URI_CHARS}; downscale it`);
+      const limit = uri.startsWith("data:") ? MAX_DATA_URI_CHARS : MAX_URL_CHARS;
+      if (uri.length > limit) {
+        console.error(`SKIP ${id}: ${uri.length} chars > ${limit}; downscale it or shorten the URL`);
         continue;
       }
       chunk.push(id);
@@ -148,6 +160,7 @@ async function submitGroup(group: Item[]): Promise<void> {
     requests.push({
       model: MODEL,
       encoding_format: "base64",
+      ...(EMBED_DTYPE === "float16" ? { embed_dtype: "float16" } : {}),
       input: uris.map((url) => [{ role: "user", content: [{ type: "image_url", image_url: { url } }] }]),
       metadata: { custom_ids: chunk }, // response.data[i] is custom_ids[i]
     });

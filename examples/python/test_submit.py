@@ -5,7 +5,8 @@ import json
 import time
 import unittest
 
-from submit import reconcile
+import submit
+from submit import idempotency_key, image_url, reconcile
 
 
 class FakeS3:
@@ -53,6 +54,26 @@ class ReconcileTest(unittest.TestCase):
         s3 = FakeS3({"groups/legacy.json": group(("Success", ["a"]), ("Failed", ["b"]))})
         self.assertEqual(reconcile(entries, s3, "s3://bucket", 24, False), {"a", "b"})
         self.assertEqual(reconcile(entries, s3, "s3://bucket", 24, True), {"a"})
+
+
+class KeyTest(unittest.TestCase):
+    def test_same_body_same_key_and_a_salt_changes_it(self):
+        body = b'{"requests": []}'
+        self.assertEqual(idempotency_key(body, ""), idempotency_key(body, ""))
+        self.assertNotEqual(idempotency_key(body, ""), idempotency_key(body, "reconcile-1"))
+        self.assertNotEqual(idempotency_key(body, ""), idempotency_key(body + b" ", ""))
+        self.assertRegex(idempotency_key(body, ""), "^[0-9a-f]{64}$")
+
+
+class ImageUrlTest(unittest.TestCase):
+    def test_https_as_is_s3_presigned_only_when_asked(self):
+        class Signer:
+            def generate_presigned_url(self, op, Params, ExpiresIn):
+                return f"https://{Params['Bucket']}.s3.amazonaws.com/{Params['Key']}?X-Amz-Expires={ExpiresIn}"
+
+        submit._s3.client = Signer()
+        self.assertEqual(image_url("https://cdn.example.com/a.jpg", 0), "https://cdn.example.com/a.jpg")
+        self.assertEqual(image_url("s3://b/cats/1.jpg", 259200), "https://b.s3.amazonaws.com/cats/1.jpg?X-Amz-Expires=259200")
 
 
 if __name__ == "__main__":
