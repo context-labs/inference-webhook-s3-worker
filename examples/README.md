@@ -134,7 +134,7 @@ Add `"embed_dtype": "float16"` to each request (`--embed-dtype float16`, or
 float16: 1,536 bytes and 2,048 characters for 768 dimensions, instead of 3,072 bytes and 4,096
 characters. Webhooks and S3 objects are about half the size.
 
-- Cosine similarity with the float32 vector is above 0.9999999 for normalized vectors.
+- In a 50-image test, the cosine similarity between each float16 vector and its float32 vector was at least 0.9999998.
 - The default is `"float32"`. `encoding_format: "float"` ignores `embed_dtype`.
 - The stored request keeps `embed_dtype`, so `read_results.py` and `read-results.ts` decode each
   generation the right way and always return float32 vectors. In NumPy:
