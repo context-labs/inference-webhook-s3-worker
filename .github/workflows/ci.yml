@@ -20,7 +20,7 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - name: Check the Python and shell examples
-        run: python3 -m py_compile examples/python/*.py && bash -n examples/curl.sh
+        run: python3 -m py_compile examples/python/*.py && python3 -m unittest discover examples/python && bash -n examples/curl.sh
       - run: npm test
       - run: npm run build
 

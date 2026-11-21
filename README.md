@@ -171,6 +171,7 @@ python3 -c 'import base64, struct, sys; print((lambda b: struct.unpack(f"<{len(b
 | `webhook.test` (`test`, `test --remote`, and setup with an API key) | `<S3_KEY_PREFIX>tests/webhook-test.json` |
 
 - The dashboard's **Test Webhook** sends a sample `generation.completed`, `slow-group.completed` or `async-embedding.completed` event with an id that starts with `test-`. It lands at, for example, `<S3_KEY_PREFIX>groups/test-group-1795132156487.json`.
+- When a request in a delivery failed, the Worker also writes a small marker object at `<S3_KEY_PREFIX>failures/<key>`, for example `failures/groups/<groupId>.json`. [Reconcile](examples/README.md#reconcile-with-s3) lists these markers to find results with failed requests.
 - `setup` and `status` also write `<S3_KEY_PREFIX>tests/setup-probe.json` and `<S3_KEY_PREFIX>tests/status-probe.json` to prove that writes work.
 
 </details>

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import worker, { type Env, objectKey } from "../src/index";
+import worker, { type Env, hasFailure, objectKey } from "../src/index";
 
 const env: Env = {
   WEBHOOK_PATH_SECRET: "path-secret",
@@ -25,7 +25,8 @@ function delivery({
   path = "/path-secret",
   method = "POST",
   headers = {},
-}: { path?: string; method?: string; headers?: Record<string, string> } = {}): Request {
+  body = groupBody,
+}: { path?: string; method?: string; headers?: Record<string, string>; body?: string } = {}): Request {
   return new Request(`https://worker.example.com${path}`, {
     method,
     headers: {
@@ -36,7 +37,7 @@ function delivery({
       "X-Inference-Delivery-Attempt": "1",
       ...headers,
     },
-    body: method === "POST" ? groupBody : undefined,
+    body: method === "POST" ? body : undefined,
   });
 }
 
@@ -118,18 +119,67 @@ describe("objectKey", () => {
   });
 });
 
+describe("hasFailure", () => {
+  const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).buffer;
+  const generation = (state: string, metadata: Record<string, unknown> = {}) => ({ id: "gen_1", state, request: { metadata } });
+  const group = (status: string, ...generations: unknown[]) => ({ event: "slow-group.completed", data: { status, generations } });
+
+  it.each([
+    ["every request succeeded", group("completed", generation("Success"), generation("Success")), false],
+    ["a request failed", group("completed", generation("Success"), generation("Failed")), true],
+    ["a request was cancelled", group("completed", generation("Cancelled")), true],
+    ["the group failed with no generations", group("failed"), true],
+    ["a failed generation event", { event: "async-embedding.completed", data: generation("Failed") }, true],
+    ["a successful generation event", { event: "async-embedding.completed", data: generation("Success") }, false],
+    ["the words inside a string value", group("completed", generation("Success", { note: '"state":"Failed"' })), false],
+  ])("%s -> %s", (_, payload, expected) => {
+    expect(hasFailure(encode(payload))).toBe(expected);
+  });
+
+  it("allows whitespace around the colon", () => {
+    const text = new TextEncoder().encode(JSON.stringify(group("completed", generation("Failed")), null, 2)).buffer;
+    expect(hasFailure(text)).toBe(true);
+  });
+});
+
 describe("S3 write", () => {
   it("PUTs the raw body to a virtual-hosted AWS URL and returns 200", async () => {
     const fetchMock = mockS3(new Response(null, { status: 200 }));
     const response = await worker.fetch(delivery(), env, ctx);
 
     expect(response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(await response.text()).toBe("embeddings/groups/grp_123.json");
     const sent = fetchMock.mock.calls[0]?.[0] as Request;
     expect(sent.method).toBe("PUT");
     expect(sent.url).toBe("https://results.s3.us-east-1.amazonaws.com/embeddings/groups/grp_123.json");
     expect(sent.headers.get("authorization")).toMatch(/^AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE\/\d{8}\/us-east-1\/s3\//);
     expect(await sent.text()).toBe(groupBody);
+  });
+
+  it("writes failures/<key> before the result when a request failed", async () => {
+    const body = JSON.stringify({
+      event: "slow-group.completed",
+      groupId: "grp_123",
+      data: { groupSize: 2, status: "completed", generations: [{ id: "gen_1", state: "Success" }, { id: "gen_2", state: "Failed" }] },
+    });
+    const fetchMock = mockS3(new Response(null, { status: 200 }), new Response(null, { status: 200 }));
+    const response = await worker.fetch(delivery({ body }), env, ctx);
+
+    expect(response.status).toBe(200);
+    const [marker, result] = fetchMock.mock.calls.map(([request]) => request as Request);
+    expect(marker?.url).toBe("https://results.s3.us-east-1.amazonaws.com/embeddings/failures/groups/grp_123.json");
+    expect(result?.url).toBe("https://results.s3.us-east-1.amazonaws.com/embeddings/groups/grp_123.json");
+    expect(await result?.text()).toBe(body);
+  });
+
+  it("returns 502 and skips the result when the marker write fails", async () => {
+    const body = JSON.stringify({ event: "slow-group.completed", groupId: "grp_123", data: { status: "failed", generations: [] } });
+    const fetchMock = mockS3(new Response("<Error><Code>AccessDenied</Code></Error>", { status: 403 }));
+    const response = await worker.fetch(delivery({ body }), env, ctx);
+
+    expect(response.status).toBe(502);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("uses a path-style URL on a custom endpoint", async () => {

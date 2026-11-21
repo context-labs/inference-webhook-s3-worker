@@ -132,7 +132,15 @@ async function handleDelivery(request: Request, env: Env, ctx: WorkerContext): P
     return fail(env, ctx, request, 400, "Unsupported event or missing id header");
   }
 
-  const result = await putObject(env, `${prefix}${key}`, await request.arrayBuffer());
+  const body = await request.arrayBuffer();
+  // Written before the result, so a saved result with a failed request always has its marker.
+  if (hasFailure(body)) {
+    const marker = await putObject(env, `${prefix}failures/${key}`, "{}");
+    if (!marker.ok) {
+      return fail(env, ctx, request, 502, marker.message);
+    }
+  }
+  const result = await putObject(env, `${prefix}${key}`, body);
   if (!result.ok) {
     return fail(env, ctx, request, 502, result.message);
   }
@@ -218,6 +226,20 @@ export function objectKey(headers: Headers): string | null {
         ? ["generations", headers.get("x-inference-generation-id")]
         : [null, null];
   return folder && id && SAFE_ID.test(id) ? `${folder}/${id}.json` : null;
+}
+
+// A generation state other than "Success", or a group that failed as a whole. A quote inside a
+// JSON string is escaped, so only real fields match. Another field named "state" can match too,
+// which only costs a reader one extra GET.
+const FAILURE = /"state"\s*:\s*"(?!Success")|"status"\s*:\s*"failed"/;
+
+/**
+ * True when a delivery holds a request that did not succeed. The Worker then
+ * also writes `failures/<key>`, so a reader finds those results by listing
+ * keys. Scans the text instead of parsing it, which keeps CPU per delivery low.
+ */
+export function hasFailure(body: ArrayBuffer): boolean {
+  return FAILURE.test(new TextDecoder().decode(body));
 }
 
 /** Virtual-hosted URL on AWS; path-style on a custom endpoint (R2, MinIO). */
