@@ -4,11 +4,13 @@ Each group = up to 10 requests x 50 images = 500 images, one webhook, one S3 obj
 Every submitted group is printed and appended to a JSONL log; rerunning with the same log
 skips images that are already submitted, so an interrupted run resumes.
 
-Usage (Python 3.10+, stdlib only):
+Usage (Python 3.10+, stdlib only; boto3 for s3:// paths and --reconcile):
   export INFERENCE_API_KEY=... INFERENCE_WEBHOOK_ID=... INFERENCE_MODEL=...
   python submit.py ./images                   # every .jpg/.jpeg/.png/.webp under a folder; id = relative path
   python submit.py manifest.csv               # CSV with header "id,path"; path may be s3://bucket/key (needs boto3)
   python submit.py manifest.csv --rate 2000 --concurrency 16 --log submitted.jsonl
+  python submit.py manifest.csv --reconcile s3://my-bucket/embeddings/ --dry-run   # count ids with no result in S3
+  python submit.py manifest.csv --reconcile s3://my-bucket/embeddings/             # resubmit only those
 
 Exit code 1 if any group or image failed; rerun the same command to retry only those.
 """
@@ -100,6 +102,52 @@ def post_group(body: bytes, api_key: str) -> str:
     raise AssertionError("unreachable")
 
 
+def reconcile(entries: list[dict], s3, s3_url: str, pending_hours: float, get_all: bool) -> set[str]:
+    """Ids from the log that need no resubmit: their result is in S3, or their group is still running.
+
+    s3_url is s3://<bucket>/<S3_KEY_PREFIX>. LISTs of <prefix>groups/ and <prefix>failures/groups/
+    cover every group. A saved group counts in full, unless the Worker marked it in failures/
+    (a request in it failed): then one GET finds the ids of its successful requests. get_all GETs
+    every saved group, for groups saved by a Worker that writes no markers. A group that is not
+    saved counts while it is younger than pending_hours: inference.net may still be running or
+    delivering it.
+    """
+    bucket, _, prefix = s3_url.removeprefix("s3://").partition("/")
+    keys = {f"groups/{entry['groupId']}.json": entry for entry in entries}
+
+    def listed(sub: str) -> set[str]:
+        """Keys under prefix + sub, without the prefix, that belong to a logged group."""
+        pages = s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix + sub)
+        found = (obj["Key"][len(prefix) :] for page in pages for obj in page.get("Contents", []))
+        return {key for key in found if key.removeprefix("failures/") in keys}
+
+    def succeeded_ids(key: str) -> list[str]:
+        doc = json.load(s3.get_object(Bucket=bucket, Key=prefix + key)["Body"])
+        gens = doc["data"]["generations"]
+        return [i for gen in gens if gen["state"] == "Success" for i in gen["request"]["metadata"]["custom_ids"]]
+
+    saved, marked = listed("groups/"), listed("failures/groups/")
+    done: set[str] = set()
+    to_get, pending, missing = [], 0, 0
+    for key, entry in keys.items():
+        if key not in saved:
+            if time.time() - entry["submitted_at"] < pending_hours * 3600:
+                done.update(entry["custom_ids"])
+                pending += 1
+            else:
+                missing += 1
+        elif get_all or f"failures/{key}" in marked:
+            to_get.append(key)
+        else:
+            done.update(entry["custom_ids"])
+    with ThreadPoolExecutor(16) as pool:
+        for ids in pool.map(succeeded_ids, to_get):
+            done.update(ids)
+    print(f"reconcile: {len(saved)} logged groups in S3 ({len(to_get)} read), {pending} still running, "
+          f"{missing} never arrived", file=sys.stderr)
+    return done
+
+
 class Pacer:
     """Spaces group starts so the run averages `rate` images/s across all threads."""
 
@@ -122,20 +170,35 @@ def main() -> None:
     ap.add_argument("--concurrency", type=int, default=8, help="groups in flight (default 8)")
     ap.add_argument("--images-per-request", type=int, default=50, help="1-50 (default 50)")
     ap.add_argument("--requests-per-group", type=int, default=10, help="1-50 (default 10)")
+    ap.add_argument("--reconcile", metavar="S3_URL",
+                    help="s3://<bucket>/<S3_KEY_PREFIX>: skip only ids whose result is in S3, not every logged id")
+    ap.add_argument("--pending-hours", type=float, default=24,
+                    help="with --reconcile: a logged group not in S3 yet counts as running for this long (default 24)")
+    ap.add_argument("--get-all", action="store_true",
+                    help="with --reconcile: also read groups without a failures/ marker (saved by an older Worker)")
+    ap.add_argument("--dry-run", action="store_true", help="print what would be submitted, submit nothing")
     args = ap.parse_args()
-    api_key, webhook_id = os.environ["INFERENCE_API_KEY"], os.environ["INFERENCE_WEBHOOK_ID"]
 
-    done: set[str] = set()
+    entries = []
     if os.path.exists(args.log):
         with open(args.log) as f:
-            for line in f:
-                done.update(json.loads(line)["custom_ids"])
+            entries = [json.loads(line) for line in f]
+    if args.reconcile:
+        import boto3  # pip install boto3
+
+        done = reconcile(entries, boto3.client("s3"), args.reconcile, args.pending_hours, args.get_all)
+    else:
+        done = {i for entry in entries for i in entry["custom_ids"]}
     # ponytail: the whole manifest and resume set live in memory; shard
     # billion-image manifests into files of a few million rows, one process each.
     todo = [item for item in list_images(args.source) if item[0] not in done]
     per_group = args.images_per_request * args.requests_per_group
     groups = [todo[i : i + per_group] for i in range(0, len(todo), per_group)]
-    print(f"{len(done)} already submitted, {len(todo)} to go in {len(groups)} groups", file=sys.stderr)
+    skipped = "have a result or are running" if args.reconcile else "already submitted"
+    print(f"{len(done)} {skipped}, {len(todo)} to go in {len(groups)} groups", file=sys.stderr)
+    if args.dry_run:
+        return
+    api_key, webhook_id = os.environ["INFERENCE_API_KEY"], os.environ["INFERENCE_WEBHOOK_ID"]
 
     log, log_lock, pacer = open(args.log, "a"), threading.Lock(), Pacer(args.rate)
     failures = 0

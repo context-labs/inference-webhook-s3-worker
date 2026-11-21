@@ -153,6 +153,40 @@ Only the missing ids go out. The exit code is `1` while any image is still unsub
 The manifest and the log stay in memory. For billions of images, split the job into
 manifests of a few million rows, with one process and one log for each.
 
+### Reconcile with S3
+
+The log says what was submitted, not what landed. A group can be accepted and still have no
+result: a request in it failed, or its webhook never reached the Worker within inference.net's
+3 days of retries. To resubmit only the ids that have no result in your bucket, add `--reconcile`
+with your bucket and `S3_KEY_PREFIX`:
+
+```sh
+pip install boto3
+python examples/python/submit.py ./images --reconcile s3://my-bucket/embeddings/ --dry-run
+# reconcile: 4 logged groups in S3 (1 read), 1 still running, 0 never arrived
+# 45 have a result or are running, 5 to go in 1 groups
+python examples/python/submit.py ./images --reconcile s3://my-bucket/embeddings/
+```
+
+- It LISTs `<prefix>groups/` and `<prefix>failures/groups/`, and compares them with the log.
+  It reads (GETs) only groups that have a failure marker: one LIST request per 1,000 groups,
+  plus one GET per group with a failed request.
+- For a group with a failed request, the Worker also writes a small marker object at
+  `<prefix>failures/groups/<groupId>.json`. Reconcile reads that group and resubmits only the
+  ids of its failed requests.
+- A logged group with no object counts as still running for 24 hours after its submit. Change
+  it with `--pending-hours`. A group can still land later, because inference.net retries a
+  webhook for about 3 days. You then get its ids twice, so key results by `custom_id`.
+- If `npm run cli -- status <name>` fails, fix the Worker first. Resubmitted groups need it too.
+- Resubmitted groups go into the same log, so you can run reconcile again.
+- The access key needs `s3:ListBucket` on the bucket and `s3:GetObject` on the prefix. For R2 or
+  another S3-compatible store, set `AWS_ENDPOINT_URL_S3` to its endpoint.
+- The log of `submit-embeddings.ts` has the same format, so reconcile works with it too.
+
+Workers deployed before failure markers keep working, but write no markers. Run `git pull` and
+`npm run cli -- update <name>` to get them. For groups saved before the update, add `--get-all`:
+reconcile then reads every saved group.
+
 ## Reading results
 
 The Worker writes one object per group, `<S3_KEY_PREFIX>groups/<groupId>.json`, when
@@ -167,5 +201,7 @@ data.generations[]          one entry per request, NOT in submission order
 ```
 
 - Map each generation through **its own** `request.metadata.custom_ids`, by `index`. Never map by array position across generations: their order differs from the request order.
-- A request with `state: "Failed"` has no vectors. Resubmit its custom ids.
+- A request with `state: "Failed"` has no vectors. Resubmit its custom ids, or run
+  [reconcile](#reconcile-with-s3). The Worker also writes `<prefix>failures/groups/<groupId>.json`
+  for such a group.
 - The vectors are L2-normalized, so cosine similarity is a dot product. `read_results.py` warns when a norm is not about 1.
