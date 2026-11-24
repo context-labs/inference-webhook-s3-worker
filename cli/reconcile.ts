@@ -15,7 +15,7 @@ import { hasFailure, objectUrl, SAFE_ID, SAFE_KEY_PREFIX } from "../src/index.ts
 
 export const DEFAULT_API_URL = "https://api.inference.net";
 
-/** A group to check. `status` and `completedAt` come from the listing; the log knows only the id. */
+/** A group to check. `status` and `completedAt` (ISO) come from the listing; the log knows only the id. */
 export interface Group {
   id: string;
   status?: string;
@@ -258,13 +258,13 @@ export interface Generation {
 /**
  * The `slow-group.completed` body the webhook sends for this group: the same
  * fields in the same order, with every image URL replaced by "REDACTED".
- * `timestamp` is when the group finished; the listing gives it, else the last
- * generation's finishedAt (a few hundred milliseconds before the webhook's).
+ * `timestamp` is the last generation's finishedAt, a few hundred milliseconds before
+ * the webhook's (the listing's completed_at is whole seconds, so it is only the fallback).
  */
 export function groupPayload(group: Group, generations: Generation[]): unknown {
   return {
     event: "slow-group.completed",
-    timestamp: group.completedAt ?? latestFinishedAt(generations) ?? new Date().toISOString(),
+    timestamp: latestFinishedAt(generations) ?? group.completedAt ?? new Date().toISOString(),
     groupId: group.id,
     data: {
       groupSize: generations.length,
@@ -353,9 +353,21 @@ export function logLineId(line: string): string {
   }
 }
 
-/** One page of `GET /v1/async/groups`. */
+/** One page of `GET /v1/async/groups`, newest group first. Timestamps are Unix seconds. */
 interface GroupPage {
-  data: Array<{ id: string; status: string; created_at: number | string; completed_at: number | string | null }>;
+  object: "list";
+  data: Array<{
+    id: string;
+    object: "group";
+    /** validating, in_progress, finalizing, completed, failed, expired, cancelling or cancelled. */
+    status: string;
+    created_at: number;
+    /** Null until the group completes. */
+    completed_at: number | null;
+    request_counts: { total: number; completed: number; failed: number };
+  }>;
+  first_id: string;
+  last_id: string;
   has_more: boolean;
 }
 
@@ -371,7 +383,7 @@ export async function* listSource(
 ): AsyncGenerator<SourceItem> {
   let cursor = after;
   for (;;) {
-    const query = new URLSearchParams({ limit: "100", since: unixSeconds(since), until: unixSeconds(until) });
+    const query = new URLSearchParams({ limit: "1000", since: since.toISOString(), until: until.toISOString() });
     if (cursor) query.set("after", cursor);
     const url = `${options.apiUrl}/v1/async/groups?${query}`;
     const response = await send(options, () => new Request(url, { headers: { Authorization: `Bearer ${options.apiKey}` } }));
@@ -383,23 +395,17 @@ export async function* listSource(
     const page = (await response.json()) as GroupPage;
     for (const group of page.data) {
       yield {
-        group: { id: group.id, status: group.status, completedAt: isoTime(group.completed_at) },
+        group: {
+          id: group.id,
+          status: group.status,
+          completedAt: group.completed_at === null ? undefined : new Date(group.completed_at * 1000).toISOString(),
+        },
         position: group.id,
       };
     }
-    if (!page.has_more || page.data.length === 0) return;
-    cursor = page.data[page.data.length - 1]!.id;
+    if (!page.has_more || page.last_id === "") return;
+    cursor = page.last_id;
   }
-}
-
-function unixSeconds(date: Date): string {
-  return String(Math.floor(date.getTime() / 1000));
-}
-
-/** Unix seconds or an ISO string, as ISO; undefined for null. */
-function isoTime(value: number | string | null): string | undefined {
-  if (value === null) return undefined;
-  return typeof value === "number" ? new Date(value * 1000).toISOString() : value;
 }
 
 /** Sends a request, retrying network errors, 429 and 5xx with backoff. `make` builds a fresh, signed request each time. */

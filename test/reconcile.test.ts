@@ -45,7 +45,7 @@ function generation(id: string, state = "Success", finishedAt = "2026-11-20T05:3
 function fakeServices({
   objects = new Map<string, string>(),
   groups = {} as Record<string, Generation[]>,
-  pages = [] as Array<{ data: unknown[]; has_more: boolean }>,
+  pages = [] as Array<GroupPage>,
   flaky = 0,
 } = {}) {
   const requests: Array<{ method: string; url: URL; headers: Headers }> = [];
@@ -78,6 +78,20 @@ function fakeServices({
     return new Response("unexpected", { status: 500 });
   }) as typeof fetch;
   return { fetch: fetchFn, objects, requests };
+}
+
+type ListedGroup = { id: string; status: string; created_at: number; completed_at: number | null };
+type GroupPage = { object: "list"; data: unknown[]; first_id: string; last_id: string; has_more: boolean };
+
+/** A page of `GET /v1/async/groups` in the endpoint's exact shape. */
+function page(groups: ListedGroup[], hasMore: boolean): GroupPage {
+  return {
+    object: "list",
+    data: groups.map((group) => ({ ...group, object: "group", request_counts: { total: 1, completed: 1, failed: 0 } })),
+    first_id: groups[0]?.id ?? "",
+    last_id: groups.at(-1)?.id ?? "",
+    has_more: hasMore,
+  };
 }
 
 function options(fetchFn: typeof fetch, extra: Partial<ReconcileOptions> = {}): ReconcileOptions & { lines: string[] } {
@@ -220,11 +234,11 @@ describe("logLineId", () => {
 });
 
 describe("listSource", () => {
-  it("pages with after, sends since and until as Unix seconds, and passes status and completed_at on", async () => {
+  it("pages with last_id, sends since and until as ISO timestamps, and passes status and completed_at on", async () => {
     const services = fakeServices({
       pages: [
-        { data: [{ id: "g1", status: "completed", created_at: 1795000000, completed_at: 1795000100 }], has_more: true },
-        { data: [{ id: "g2", status: "in_progress", created_at: 1795000001, completed_at: null }], has_more: false },
+        page([{ id: "g1", status: "completed", created_at: 1795000000, completed_at: 1795000100 }], true),
+        page([{ id: "g2", status: "in_progress", created_at: 1795000001, completed_at: null }], false),
       ],
     });
     const result: SourceItem[] = [];
@@ -238,8 +252,8 @@ describe("listSource", () => {
     ]);
     const queries = services.requests.map((r) => Object.fromEntries(r.url.searchParams));
     expect(queries).toEqual([
-      { limit: "100", since: "1793491200", until: "1793577600", after: "g0" },
-      { limit: "100", since: "1793491200", until: "1793577600", after: "g1" },
+      { limit: "1000", since: "2026-11-01T00:00:00.000Z", until: "2026-11-02T00:00:00.000Z", after: "g0" },
+      { limit: "1000", since: "2026-11-01T00:00:00.000Z", until: "2026-11-02T00:00:00.000Z", after: "g1" },
     ]);
   });
 
@@ -247,14 +261,14 @@ describe("listSource", () => {
     const services = fakeServices({
       groups: { g2: [generation("gv2_a", "Failed")] },
       pages: [
-        {
-          data: [
+        page(
+          [
             { id: "g1", status: "in_progress", created_at: 1, completed_at: null },
             { id: "g2", status: "expired", created_at: 2, completed_at: null },
-            { id: "g3", status: "completed", created_at: 3, completed_at: "2026-11-23T20:00:00.000Z" },
+            { id: "g3", status: "completed", created_at: 3, completed_at: Date.parse("2026-11-23T20:00:00Z") / 1000 },
           ],
-          has_more: false,
-        },
+          false,
+        ),
       ],
     });
     const opts = options(services.fetch);
@@ -274,9 +288,13 @@ describe("listSource", () => {
 });
 
 describe("groupPayload and scrubImageUrls", () => {
-  it("takes the timestamp from the listing when it has one", () => {
-    const payload = groupPayload({ id: "g", status: "completed", completedAt: "2026-11-20T06:00:00.000Z" }, [generation("a")]);
-    expect(payload).toMatchObject({ timestamp: "2026-11-20T06:00:00.000Z", data: { groupSize: 1, status: "completed" } });
+  it("takes the timestamp from the last finishedAt, and from the listing only when no generation has one", () => {
+    const listed = { id: "g", status: "completed", completedAt: "2026-11-20T06:00:00.000Z" };
+    expect(groupPayload(listed, [generation("a")])).toMatchObject({
+      timestamp: "2026-11-20T05:38:15.208Z",
+      data: { groupSize: 1, status: "completed" },
+    });
+    expect(groupPayload(listed, [{ ...generation("a"), finishedAt: null }])).toMatchObject({ timestamp: "2026-11-20T06:00:00.000Z" });
   });
 
   it("redacts a single-image input, a batch, and chat image parts, and keeps text", () => {
