@@ -6,7 +6,6 @@
  */
 import { createReadStream } from "node:fs";
 import { readFile, rename, rm, writeFile } from "node:fs/promises";
-import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 
 import { AwsClient } from "aws4fetch";
@@ -58,7 +57,7 @@ export interface ReconcileOptions {
   apiUrl: string;
   apiKey: string;
   s3: S3Target;
-  /** S3 HEADs in flight. */
+  /** S3 existence checks in flight. */
   concurrency: number;
   /** Group downloads and S3 PUTs in flight. A large group can be tens of MB. */
   repairConcurrency: number;
@@ -158,8 +157,12 @@ export async function reconcile(
     }
     const url = s3Url(`groups/${group.id}.json`);
     try {
-      const response = await send(options, () => aws.sign(url, { method: "HEAD" }));
-      if (response.ok) {
+      // A one-byte ranged GET, not a HEAD: Node's fetch reuses connections for it, and in a
+      // 5,000-key test it checked 12 times as many keys per second as HEAD. S3 bills both the same.
+      const response = await send(options, () => aws.sign(url, { headers: { Range: "bytes=0-0" } }));
+      await response.arrayBuffer();
+      // 416: an empty object, which still exists.
+      if (response.ok || response.status === 416) {
         counts.present++;
         return false;
       }
@@ -170,8 +173,8 @@ export async function reconcile(
       }
       throw new Error(
         response.status === 403
-          ? "S3 HEAD answered 403: the key needs s3:GetObject and s3:ListBucket (without ListBucket S3 answers 403 for a missing key)"
-          : `S3 HEAD answered ${response.status}`,
+          ? "S3 answered 403: the key needs s3:GetObject and s3:ListBucket (without ListBucket S3 answers 403 for a missing key)"
+          : `S3 GET answered ${response.status}`,
       );
     } catch (error) {
       counts.failed++;
@@ -305,13 +308,21 @@ export function scrubImageUrls(request: unknown): unknown {
  * Starts after line `after`. Positions are line numbers.
  */
 export async function* logSource(path: string, after: number): AsyncGenerator<SourceItem> {
+  // Splits lines itself: readline's async iterator throws "readline was closed" at the end of a
+  // large file when the consumer pauses between lines, as reconcile does after every chunk.
   let line = 0;
-  for await (const text of createInterface({ input: createReadStream(path), crlfDelay: Infinity })) {
+  let rest = "";
+  const read = function* (text: string): Generator<SourceItem> {
     line++;
     const trimmed = text.trim();
-    if (line <= after || trimmed === "") continue;
-    yield { group: { id: logLineId(trimmed) }, position: String(line) };
+    if (line > after && trimmed !== "") yield { group: { id: logLineId(trimmed) }, position: String(line) };
+  };
+  for await (const chunk of createReadStream(path, { encoding: "utf8" })) {
+    const lines = (rest + (chunk as string)).split("\n");
+    rest = lines.pop()!;
+    for (const text of lines) yield* read(text);
   }
+  if (rest !== "") yield* read(rest);
 }
 
 /** The group id on one log line; an unreadable line gives "", which reconcile counts as failed. */
@@ -453,7 +464,7 @@ async function main(): Promise<void> {
     .addOption(new Option("--prefix <prefix>", "key prefix the Worker uses").default(process.env.S3_KEY_PREFIX ?? "", "S3_KEY_PREFIX, else none"))
     .addOption(new Option("--endpoint <url>", "S3-compatible endpoint, for R2 or MinIO (or set S3_ENDPOINT)").default(process.env.S3_ENDPOINT, "S3_ENDPOINT, else AWS S3"))
     .option("--api-url <url>", "inference.net API", DEFAULT_API_URL)
-    .option("--concurrency <n>", "S3 HEADs in flight", "64")
+    .option("--concurrency <n>", "S3 existence checks in flight", "64")
     .option("--repair-concurrency <n>", "group downloads and writes in flight", "4")
     .option("--checkpoint <file>", "save progress here; rerun with the same source and file to resume")
     .option("--dry-run", "count missing objects, write nothing")

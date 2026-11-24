@@ -365,7 +365,7 @@ Where the group ids come from:
 
 How it works:
 
-1. For each group, a `HEAD` on `<prefix>groups/<groupId>.json` (`--concurrency`, default 64).
+1. For each group, a one-byte ranged `GET` of `<prefix>groups/<groupId>.json` (`--concurrency`, default 64). It costs the same as a `HEAD`, and Node reuses connections for it, so it is faster.
 2. For each missing group, `GET /v1/async/group/<groupId>/generations`, then a `PUT` of the webhook body built from it (`--repair-concurrency`, default 4). A group that is still running counts as `pending` and is left alone.
 3. As the Worker does, it writes the `failures/` marker first when a request in the group failed.
 

@@ -59,7 +59,10 @@ function fakeServices({
     }
     if (url.host === BUCKET_HOST) {
       const key = url.pathname.slice(1);
-      if (input.method === "HEAD") return new Response(null, { status: objects.has(key) ? 200 : 404 });
+      if (input.method === "GET") {
+        expect(input.headers.get("range")).toBe("bytes=0-0");
+        return objects.has(key) ? new Response(objects.get(key)!.slice(0, 1), { status: 206 }) : new Response("NoSuchKey", { status: 404 });
+      }
       if (input.method === "PUT") {
         objects.set(key, await input.text());
         return new Response(null, { status: 200 });
@@ -141,7 +144,7 @@ describe("reconcile", () => {
     const services = fakeServices({ groups: { missing: [generation("gv2_a")] } });
     const counts = await reconcile(options(services.fetch, { dryRun: true }), "test", items("missing"));
     expect(counts).toMatchObject({ checked: 1, missing: 1, repaired: 0 });
-    expect(services.requests.map((r) => r.method)).toEqual(["HEAD"]);
+    expect(services.requests.map((r) => r.method)).toEqual(["GET"]);
   });
 
   it("retries 503 answers", async () => {
@@ -181,6 +184,20 @@ describe("reconcile", () => {
     expect(counts).toMatchObject({ checked: 250, present: 250 });
     expect(services.requests.length - heads).toBe(150);
     await expect(readFile(checkpoint)).rejects.toThrow();
+  });
+});
+
+describe("logSource", () => {
+  it("reads every line of a large file while the reader pauses between chunks", async () => {
+    const log = join(dir, "ids.txt");
+    await writeFile(log, Array.from({ length: 50_000 }, (_, index) => `id${index}`).join("\n"));
+    let count = 0;
+    let last = "";
+    for await (const item of logSource(log, 10)) {
+      if (++count % 1000 === 0) await new Promise((resolve) => setTimeout(resolve, 5));
+      last = item.group.id;
+    }
+    expect([count, last]).toEqual([49_990, "id49999"]);
   });
 });
 
