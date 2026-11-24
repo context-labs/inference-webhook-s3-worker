@@ -326,7 +326,7 @@ R2 keeps staged objects until they are copied, so a delivery waits in R2 for as 
 | `staged` | A delivery is in R2 and queued. Has `key` and `bytes`. |
 | `delivered` | A copy to S3 worked. Has `key`, `attempts` and `ms`. `result` is `already delivered` for a repeated message. |
 | `retry` | A copy failed. Has `attempts`, `delaySeconds` and `error`. |
-| `sweep` | Once a minute: `staged`, `oldestStagedAt`, `stale` (older than 15 minutes) and `requeued`. |
+| `sweep` | Once a minute: `staged`, `oldestStagedAt`, `stale` (older than 15 minutes) and `requeued`. With `stale` above 0, the sweep copied one stale delivery itself; `error` says why that copy failed. |
 
 The Queues page of the Cloudflare dashboard shows the backlog of `<name>-deliveries` and `<name>-deliveries-dlq`. A message in the dead letter queue needs no action: its staged object stays in R2, and the sweep queues it again once S3 works.
 

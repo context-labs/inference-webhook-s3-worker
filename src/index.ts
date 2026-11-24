@@ -217,7 +217,7 @@ export default {
       more: scan.more,
       oldestStagedAt: scan.oldestStagedAt,
       stale: scan.stale.length,
-      requeued: probe?.ok ? scan.stale.length : 0,
+      requeued: probe?.ok ? rest.length : 0,
       ...(probe && !probe.ok ? { error: probe.message } : {}),
     });
   },
