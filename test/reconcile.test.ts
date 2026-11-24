@@ -35,7 +35,7 @@ function generation(id: string, state = "Success", finishedAt = "2026-11-20T05:3
     finishedAt,
     request: {
       input: [[{ role: "user", content: [{ type: "image_url", image_url: { url: "https://images.example/a.jpg" } }] }]],
-      model: "google/siglip2-base-patch16-naflex",
+      model: "example/image-embedding-model",
     },
     response: state === "Success" ? { data: [{ embedding: [0.5], index: 0, object: "embedding" }] } : null,
   };
