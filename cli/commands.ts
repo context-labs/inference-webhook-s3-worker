@@ -862,7 +862,7 @@ async function remoteTestDelivery(
     );
     return false;
   }
-  deps.out.ok("inference.net sent it, and the Worker answered HTTP 200 after S3 stored it");
+  deps.out.ok(`inference.net sent it, and the Worker answered HTTP 200 after ${deployment.buffer ? "staging it for S3" : "S3 stored it"}`);
   return waitForTestDelivery(deps, deployment, secrets, since);
 }
 
