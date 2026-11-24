@@ -340,7 +340,7 @@ On top of direct mode, per million deliveries: R2 writes about $4.50, R2 reads a
 
 ## Reconcile missing results
 
-inference.net retries a failed delivery for about 68 hours, then gives up. After a longer outage or a misconfiguration, some results are not in S3. `reconcile` finds every finished group whose `groups/<groupId>.json` is missing and writes it: the same key, and the same JSON as the webhook body. It works the same for every way the Worker saves results, because they all write the same keys.
+inference.net retries a failed delivery for about 68 hours, then gives up. After a longer outage or a misconfiguration, some results are not in S3. `reconcile` finds every finished group whose `groups/<groupId>.json` is missing and writes it: the same key, and the same JSON as the webhook body. It works in direct and [buffered mode](#buffered-mode), because both write the same keys.
 
 ```sh
 export INFERENCE_API_KEY=... AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
@@ -369,12 +369,14 @@ How it works:
 2. For each missing group, `GET /v1/async/group/<groupId>/generations`, then a `PUT` of the webhook body built from it (`--repair-concurrency`, default 4). A group that is still running counts as `pending` and is left alone.
 3. As the Worker does, it writes the `failures/` marker first when a request in the group failed.
 
+Grace window: a group that finished less than `--grace-hours` ago (default 24) counts as `pending`, not missing, and is not written. Until then its result can still arrive: inference.net may still be retrying it, and in buffered mode it can wait in R2 staging while the queue retries S3 (about 14 hours). The tool does not read R2 staging. If S3 was down for longer than the window in buffered mode, run reconcile after `status` shows the buffer empty. If a group is rebuilt while it is still staged, the queue later overwrites it with the original delivery, so nothing is lost.
+
 Notes:
 
 - The rebuilt object matches the webhook body byte for byte, except for `timestamp`. The webhook sends the time the group was finalized. A rebuilt object has the listing's `completed_at`, or else the latest `finishedAt` of its generations (a few hundred milliseconds earlier). Rebuilt objects carry the S3 metadata `x-amz-meta-reconciled: true`.
 - It is safe to rerun. A repair writes the key that a delivery would write, and a late delivery overwrites it with the same content.
 - With `--checkpoint progress.json`, it saves its position after each chunk of groups. Rerun the same command to resume. The file is deleted when the run finishes.
-- `--dry-run` only counts. With `--from-log`, a dry run counts a group that is still running as missing.
+- `--dry-run` only counts. With `--from-log`, a dry run also counts a group that is still running, or inside the grace window, as missing.
 - The S3 key needs `s3:GetObject` and `s3:ListBucket` (without `ListBucket`, S3 answers `403` instead of `404` for a missing key), and `s3:PutObject` to repair.
 - Exit code `1` when any group failed or is still missing; `2` for a usage error.
 - Single generations (`generations/<id>.json`) are not covered: only groups.

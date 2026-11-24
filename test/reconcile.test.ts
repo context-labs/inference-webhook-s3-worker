@@ -90,6 +90,8 @@ function options(fetchFn: typeof fetch, extra: Partial<ReconcileOptions> = {}): 
     concurrency: 8,
     repairConcurrency: 2,
     dryRun: false,
+    graceMs: 24 * 3_600_000,
+    now: () => new Date("2026-11-24T00:00:00Z"),
     log: (line) => lines.push(line),
     sleep: async () => {},
     lines,
@@ -138,6 +140,13 @@ describe("reconcile", () => {
     const put = services.requests.find((r) => r.method === "PUT" && r.url.pathname === "/emb/groups/missing.json")!;
     expect(put.headers.get("x-amz-meta-reconciled")).toBe("true");
     expect(opts.lines).toContain('FAILED "../bad": not a group id');
+  });
+
+  it("counts a group that finished inside the grace window as pending, and writes nothing", async () => {
+    const services = fakeServices({ groups: { fresh: [generation("gv2_a", "Success", "2026-11-23T23:00:00.000Z")] } });
+    const counts = await reconcile(options(services.fetch), "test", items("fresh"));
+    expect(counts).toMatchObject({ checked: 1, missing: 0, pending: 1, repaired: 0 });
+    expect(services.objects.size).toBe(0);
   });
 
   it("writes nothing with dryRun", async () => {
@@ -234,7 +243,7 @@ describe("listSource", () => {
     ]);
   });
 
-  it("skips running groups without a HEAD, and saves failed groups with status failed", async () => {
+  it("skips running and recently finished groups without a check, and saves failed groups with status failed", async () => {
     const services = fakeServices({
       groups: { g2: [generation("gv2_a", "Failed")] },
       pages: [
@@ -242,6 +251,7 @@ describe("listSource", () => {
           data: [
             { id: "g1", status: "in_progress", created_at: 1, completed_at: null },
             { id: "g2", status: "expired", created_at: 2, completed_at: null },
+            { id: "g3", status: "completed", created_at: 3, completed_at: "2026-11-23T20:00:00.000Z" },
           ],
           has_more: false,
         },
@@ -249,8 +259,8 @@ describe("listSource", () => {
     });
     const opts = options(services.fetch);
     const counts = await reconcile(opts, "list", listSource(opts, new Date(0), new Date(), undefined));
-    expect(counts).toMatchObject({ checked: 2, pending: 1, missing: 1, repaired: 1 });
-    expect(services.requests.filter((r) => r.url.pathname.endsWith("/g1.json"))).toEqual([]);
+    expect(counts).toMatchObject({ checked: 3, pending: 2, missing: 1, repaired: 1 });
+    expect(services.requests.filter((r) => /\/g[13]\.json$/.test(r.url.pathname))).toEqual([]);
     expect(JSON.parse(services.objects.get("emb/groups/g2.json")!).data.status).toBe("failed");
   });
 

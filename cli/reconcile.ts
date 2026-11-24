@@ -62,6 +62,12 @@ export interface ReconcileOptions {
   /** Group downloads and S3 PUTs in flight. A large group can be tens of MB. */
   repairConcurrency: number;
   dryRun: boolean;
+  /**
+   * A group that finished less than this long ago counts as pending, not missing: its delivery
+   * may still be retried by inference.net, or wait in buffered mode's R2 staging (about 14 hours).
+   */
+  graceMs: number;
+  now: () => Date;
   /** JSON file that records progress; a rerun with the same source resumes after it. */
   checkpoint?: string;
   log: (line: string) => void;
@@ -151,7 +157,7 @@ export async function reconcile(
       options.log(`FAILED ${JSON.stringify(group.id)}: not a group id`);
       return false;
     }
-    if (group.status !== undefined && !FINAL_STATUSES.has(group.status)) {
+    if ((group.status !== undefined && !FINAL_STATUSES.has(group.status)) || recent(group.completedAt)) {
       counts.pending++;
       return false;
     }
@@ -195,7 +201,10 @@ export async function reconcile(
         );
       }
       const { generations } = (await response.json()) as { generations: Generation[] };
-      if (generations.some((generation) => RUNNING_STATES.has(generation.state))) {
+      if (
+        generations.some((generation) => RUNNING_STATES.has(generation.state)) ||
+        recent(group.completedAt ?? latestFinishedAt(generations))
+      ) {
         counts.missing--;
         counts.pending++;
         return;
@@ -203,7 +212,7 @@ export async function reconcile(
       const body = JSON.stringify(groupPayload(group, generations));
       const key = `groups/${group.id}.json`;
       // Marker first, like the Worker: a saved result with a failed request always has its marker.
-      if (hasFailure(new TextEncoder().encode(body).buffer as ArrayBuffer)) await put(`failures/${key}`, "{}");
+      if (await hasFailure(new TextEncoder().encode(body).buffer as ArrayBuffer)) await put(`failures/${key}`, "{}");
       await put(key, body);
       counts.repaired++;
       options.log(`repaired ${group.id}`);
@@ -223,6 +232,11 @@ export async function reconcile(
       }),
     );
     if (!response.ok) throw new Error(`S3 PUT ${key} answered ${response.status}: ${(await response.text()).slice(0, 300)}`);
+  }
+
+  /** True when `finishedAt` is inside the grace window. */
+  function recent(finishedAt: string | undefined): boolean {
+    return finishedAt !== undefined && options.now().getTime() - Date.parse(finishedAt) < options.graceMs;
   }
 
   function s3Url(key: string): string {
@@ -248,12 +262,9 @@ export interface Generation {
  * generation's finishedAt (a few hundred milliseconds before the webhook's).
  */
 export function groupPayload(group: Group, generations: Generation[]): unknown {
-  const finishedAt = generations
-    .map((generation) => generation.finishedAt ?? "")
-    .reduce((latest, at) => (at > latest ? at : latest), "");
   return {
     event: "slow-group.completed",
-    timestamp: group.completedAt ?? (finishedAt || new Date().toISOString()),
+    timestamp: group.completedAt ?? latestFinishedAt(generations) ?? new Date().toISOString(),
     groupId: group.id,
     data: {
       groupSize: generations.length,
@@ -261,6 +272,12 @@ export function groupPayload(group: Group, generations: Generation[]): unknown {
       generations: generations.map((generation) => ({ ...generation, request: scrubImageUrls(generation.request) })),
     },
   };
+}
+
+/** The latest `finishedAt` of the generations (ISO strings sort by time), or undefined when none has one. */
+function latestFinishedAt(generations: Generation[]): string | undefined {
+  const latest = generations.map((generation) => generation.finishedAt ?? "").reduce((a, b) => (b > a ? b : a), "");
+  return latest || undefined;
 }
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
@@ -435,6 +452,7 @@ interface CliOptions {
   apiUrl: string;
   concurrency: string;
   repairConcurrency: string;
+  graceHours: string;
   checkpoint?: string;
   dryRun?: boolean;
 }
@@ -466,6 +484,7 @@ async function main(): Promise<void> {
     .option("--api-url <url>", "inference.net API", DEFAULT_API_URL)
     .option("--concurrency <n>", "S3 existence checks in flight", "64")
     .option("--repair-concurrency <n>", "group downloads and writes in flight", "4")
+    .option("--grace-hours <hours>", "count groups that finished less than this long ago as pending, not missing", "24")
     .option("--checkpoint <file>", "save progress here; rerun with the same source and file to resume")
     .option("--dry-run", "count missing objects, write nothing")
     .showHelpAfterError()
@@ -477,6 +496,8 @@ async function main(): Promise<void> {
   if (!SAFE_KEY_PREFIX.test(cli.prefix)) usageError("--prefix may only contain A-Z a-z 0-9 / _ . -");
   const [concurrency, repairConcurrency] = [cli.concurrency, cli.repairConcurrency].map(Number);
   if (!(concurrency! >= 1 && repairConcurrency! >= 1)) usageError("--concurrency and --repair-concurrency must be at least 1");
+  const graceHours = Number(cli.graceHours);
+  if (!(graceHours >= 0)) usageError("--grace-hours must be 0 or more");
   // A dry run from a log reads only S3; everything else also calls the inference.net API.
   const needsApi = !(cli.dryRun && cli.fromLog);
   const missingEnv = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", ...(needsApi ? ["INFERENCE_API_KEY"] : [])].filter(
@@ -499,6 +520,8 @@ async function main(): Promise<void> {
     concurrency: concurrency!,
     repairConcurrency: repairConcurrency!,
     dryRun: Boolean(cli.dryRun),
+    graceMs: graceHours * 3_600_000,
+    now: () => new Date(),
     checkpoint: cli.checkpoint,
     log: (line) => console.error(line),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
