@@ -138,6 +138,14 @@ describe("hasFailure", () => {
     expect(hasFailure(encode(payload))).toBe(expected);
   });
 
+  it("finds a failure that straddles two 1 MB scan slices, or sits at the end of a large body", () => {
+    const padding = "x".repeat((1 << 20) - 10);
+    const straddling = new TextEncoder().encode(`{"pad":"${padding}","state":"Failed"}`).buffer;
+    const atEnd = new TextEncoder().encode(`{"pad":"${padding.repeat(3)}","status":"failed"}`).buffer;
+    const clean = new TextEncoder().encode(`{"pad":"${padding.repeat(3)}","state":"Success"}`).buffer;
+    expect([straddling, atEnd, clean].map(hasFailure)).toEqual([true, true, false]);
+  });
+
   it("allows whitespace around the colon", () => {
     const text = new TextEncoder().encode(JSON.stringify(group("completed", generation("Failed")), null, 2)).buffer;
     expect(hasFailure(text)).toBe(true);

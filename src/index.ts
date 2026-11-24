@@ -441,13 +441,23 @@ export function objectKey(headers: Headers): string | null {
 // which only costs a reader one extra GET.
 const FAILURE = /"state"\s*:\s*"(?!Success")|"status"\s*:\s*"failed"/;
 
+// hasFailure decodes 1 MB at a time, so a large delivery is not held twice in memory, once as bytes and
+// once as text. Slices overlap by 1 KB, so a match is never cut in two.
+const SCAN_SLICE = 1 << 20;
+const SCAN_OVERLAP = 1 << 10;
+
 /**
  * True when a delivery holds a request that did not succeed. The Worker then
  * also writes `failures/<key>`, so a reader finds those results by listing
  * keys. Scans the text instead of parsing it, which keeps CPU per delivery low.
  */
 export function hasFailure(body: ArrayBuffer): boolean {
-  return FAILURE.test(new TextDecoder().decode(body));
+  const decoder = new TextDecoder();
+  for (let start = 0; ; start += SCAN_SLICE - SCAN_OVERLAP) {
+    const end = Math.min(start + SCAN_SLICE, body.byteLength);
+    if (FAILURE.test(decoder.decode(new Uint8Array(body, start, end - start)))) return true;
+    if (end === body.byteLength) return false;
+  }
 }
 
 /** Virtual-hosted URL on AWS; path-style on a custom endpoint (R2, MinIO). */
