@@ -439,6 +439,26 @@ describe("buffered mode", () => {
     expect(msg.retry).not.toHaveBeenCalled();
   });
 
+  it("consumer: copies at most three deliveries at once, so S3 writes always get a connection", async () => {
+    const { env: bufferedEnv } = buffered();
+    const ids = Array.from({ length: 10 }, (_, index) => `grp_${index}`);
+    for (const id of ids) await worker.fetch(delivery({ headers: { "X-Inference-Group-ID": id } }), bufferedEnv, ctx);
+    let open = 0;
+    let most = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      most = Math.max(most, ++open);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      open--;
+      return new Response(null, { status: 200 });
+    });
+    const messages = ids.map((id) => message(`embeddings/groups/${id}.json`));
+
+    await worker.queue({ messages }, bufferedEnv);
+
+    expect(most).toBe(3);
+    expect(messages.every((msg) => msg.ack.mock.calls.length === 1)).toBe(true);
+  });
+
   it("consumer: keeps the staged copy and retries with backoff when S3 fails", async () => {
     const { staging, env: bufferedEnv } = buffered();
     await worker.fetch(delivery(), bufferedEnv, ctx);

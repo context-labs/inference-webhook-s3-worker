@@ -121,6 +121,10 @@ const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 // request must finish inside the platform's 30 second delivery timeout.
 const S3_RETRIES = 3;
 
+// A copy holds two connections, the R2 read and the S3 write, and a Worker invocation gets six. With
+// more copies at once, R2 reads take every connection and the S3 writes that would drain them wait forever.
+const COPIES_AT_ONCE = 3;
+
 // A failed copy to S3 waits 30 s, then twice as long each time, up to 1 hour. After 20 attempts
 // (about 14 hours) the message goes to the dead letter queue; the staged object stays in R2.
 const RETRY_BASE_SECONDS = 30;
@@ -170,21 +174,23 @@ export default {
 
   /** Buffered mode: copies staged deliveries to S3. */
   async queue(batch: { messages: readonly QueueMessage[] }, env: Env): Promise<void> {
-    await Promise.all(
-      batch.messages.map(async (message) => {
+    const pending = [...batch.messages];
+    const copyNext = async (): Promise<void> => {
+      for (let message = pending.shift(); message; message = pending.shift()) {
         const { key } = message.body;
         const started = Date.now();
         const result = await deliverStaged(env, key);
         if (result.ok) {
           message.ack();
           log("log", { event: "delivered", key, result: result.message, attempts: message.attempts, ms: Date.now() - started });
-          return;
+          continue;
         }
         const delaySeconds = retryDelaySeconds(message.attempts);
         message.retry({ delaySeconds });
         log("warn", { event: "retry", key, attempts: message.attempts, delaySeconds, error: result.message });
-      }),
-    );
+      }
+    };
+    await Promise.all(Array.from({ length: COPIES_AT_ONCE }, copyNext));
   },
 
   /**
