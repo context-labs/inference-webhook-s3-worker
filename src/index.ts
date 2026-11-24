@@ -124,6 +124,9 @@ const S3_RETRIES = 3;
 // A copy holds two connections, the R2 read and the S3 write, and a Worker invocation gets six. With
 // more copies at once, R2 reads take every connection and the S3 writes that would drain them wait forever.
 const COPIES_AT_ONCE = 3;
+// A copy that takes longer is aborted and retried, so a stalled connection cannot hold a consumer for its
+// 15 minute limit. 11 MB takes 1 to 3 seconds.
+const COPY_TIMEOUT_MS = 120_000;
 
 // A failed copy to S3 waits 30 s, then twice as long each time, up to 1 hour. After 20 attempts
 // (about 14 hours) the message goes to the dead letter queue; the staged object stays in R2.
@@ -393,12 +396,14 @@ async function putObject(
     // A stream can be sent only once; the queue retries a failed copy instead.
     retries: body instanceof ReadableStream ? 0 : S3_RETRIES,
   });
+  const signal = body instanceof ReadableStream ? AbortSignal.timeout(COPY_TIMEOUT_MS) : undefined;
   const url = objectUrl(env, key);
   try {
     const response = await s3.fetch(url, {
       method: "PUT",
       headers: { "Content-Type": "application/json", ...headers },
       body,
+      signal,
     });
     if (response.ok) {
       return { ok: true, status: response.status, message: "OK" };
