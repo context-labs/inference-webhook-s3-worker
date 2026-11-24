@@ -28,8 +28,16 @@ export interface Deployment {
   s3: S3Settings;
   /** The webhook's id in the inference.net API (not its identifier), when setup created it through the API. */
   apiWebhookId?: string;
+  /** Buffered mode's R2 bucket and queues, after `update --buffered`. */
+  buffer?: BufferResources;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface BufferResources {
+  bucket: string;
+  queue: string;
+  deadLetterQueue: string;
 }
 
 /**
@@ -80,14 +88,16 @@ export class StateStore {
     await writeFile(this.secretsPath(name), `${JSON.stringify(secrets, null, 2)}\n`, { mode: 0o600 });
   }
 
-  /** Writes the Wrangler config for one deployment: name, entry point, and the status KV binding. */
+  /** Writes the Wrangler config for one deployment: name, entry point, the status KV binding, and buffered mode's bindings. */
   async writeWranglerConfig(deployment: Deployment, compatibilityDate: string): Promise<string> {
     const path = this.wranglerConfigPath(deployment.name);
+    const buffer = deployment.buffer;
     const config = {
       name: deployment.name,
       main: "../src/index.ts",
       compatibility_date: compatibilityDate,
       kv_namespaces: [{ binding: "STATUS", id: deployment.statusNamespaceId }],
+      ...(buffer && bufferedConfig(buffer)),
     };
     await mkdir(this.dir, { recursive: true });
     await writeFile(path, `${JSON.stringify(config, null, 2)}\n`);
@@ -112,6 +122,20 @@ export class StateStore {
       [this.statePath(name), this.secretsPath(name), this.wranglerConfigPath(name)].map((path) => rm(path, { force: true })),
     );
   }
+}
+
+/** The Wrangler config that turns on buffered mode. The README shows the same block for a manual deploy. */
+export function bufferedConfig(buffer: BufferResources) {
+  return {
+    r2_buckets: [{ binding: "STAGING", bucket_name: buffer.bucket }],
+    queues: {
+      producers: [{ binding: "DELIVERIES", queue: buffer.queue }],
+      consumers: [
+        { queue: buffer.queue, max_batch_size: 10, max_batch_timeout: 1, max_retries: 20, dead_letter_queue: buffer.deadLetterQueue },
+      ],
+    },
+    triggers: { crons: ["* * * * *"] },
+  };
 }
 
 async function readJson<T>(path: string): Promise<T | null> {

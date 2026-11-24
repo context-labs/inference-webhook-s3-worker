@@ -78,6 +78,29 @@ export async function createStatusNamespace(wrangler: Wrangler, title: string, a
   return id;
 }
 
+/** Creates an R2 bucket or a queue. One that already exists counts, so `update --buffered` can run again. */
+export async function createResource(wrangler: Wrangler, kind: "r2 bucket" | "queues", name: string, accountId: string): Promise<void> {
+  const result = await wrangler([...kind.split(" "), "create", name], { accountId });
+  if (result.code !== 0 && !/code: (10004|11009)/.test(result.stderr + result.stdout)) {
+    throw wranglerError(`Could not create ${kind === "queues" ? "queue" : "R2 bucket"} ${name}`, result);
+  }
+}
+
+/** Deletes an R2 bucket or a queue. R2 refuses to delete a bucket that still holds objects: then this returns "not empty". */
+export async function deleteResource(
+  wrangler: Wrangler,
+  kind: "r2 bucket" | "queues",
+  name: string,
+  accountId: string,
+): Promise<"deleted" | "missing" | "not empty"> {
+  const result = await wrangler([...kind.split(" "), "delete", name], { accountId, input: "y\n" });
+  const output = result.stderr + result.stdout;
+  if (result.code === 0) return "deleted";
+  if (/code: 10006|does not exist/i.test(output)) return "missing";
+  if (/not empty|code: 10008/i.test(output)) return "not empty";
+  throw wranglerError(`Could not delete ${kind === "queues" ? "queue" : "R2 bucket"} ${name}`, result);
+}
+
 /** Deploys the Worker described by a Wrangler config file and returns its workers.dev URL. */
 export async function deployWorker(wrangler: Wrangler, configPath: string, accountId: string): Promise<string> {
   const result = await wrangler(["deploy", "--config", configPath], { accountId });

@@ -18,6 +18,58 @@ export interface Env {
   S3_ENDPOINT?: string;
   /** Optional KV binding. When present, the Worker records its last delivery and last error. */
   STATUS?: StatusStore;
+  /**
+   * Optional R2 bucket and queue for buffered mode. With both bound, a delivery is acknowledged once it is
+   * staged in R2 and queued; the queue consumer then copies it to S3. With neither, the Worker writes to S3 directly.
+   */
+  STAGING?: StagingBucket;
+  DELIVERIES?: DeliveryQueue;
+}
+
+/** The subset of an R2 bucket binding this Worker uses. */
+export interface StagingBucket {
+  put(key: string, value: ArrayBuffer, options: { customMetadata: Record<string, string> }): Promise<unknown>;
+  get(key: string): Promise<StagedObject | null>;
+  head(key: string): Promise<{ etag: string } | null>;
+  delete(key: string): Promise<void>;
+  list(options: { limit: number; cursor?: string }): Promise<{
+    objects: Array<{ key: string; uploaded: Date }>;
+    truncated: boolean;
+    cursor?: string;
+  }>;
+}
+
+export interface StagedObject {
+  etag: string;
+  body: ReadableStream;
+  checksums: { md5?: ArrayBuffer };
+  customMetadata?: Record<string, string>;
+}
+
+/** A queue message: the staged object's key, which is also its S3 key. */
+export interface StagedDelivery {
+  key: string;
+}
+
+/** The subset of a queue producer binding this Worker uses. */
+export interface DeliveryQueue {
+  send(body: StagedDelivery): Promise<void>;
+  sendBatch(messages: Array<{ body: StagedDelivery }>): Promise<void>;
+}
+
+export interface QueueMessage {
+  body: StagedDelivery;
+  attempts: number;
+  ack(): void;
+  retry(options: { delaySeconds: number }): void;
+}
+
+/** What `status` reports about staged deliveries that are not in S3 yet. */
+export interface BufferStatus {
+  staged: number;
+  /** True when there are more staged objects than the Worker counted. */
+  more: boolean;
+  oldestStagedAt: string | null;
 }
 
 export interface WorkerContext {
@@ -35,6 +87,8 @@ export interface WorkerStatus {
   lastDelivery: DeliveryRecord | null;
   lastError: ErrorRecord | null;
   probe: { ok: boolean; key: string; status: number; message: string } | null;
+  /** Null in direct mode. */
+  buffer: BufferStatus | null;
 }
 
 export interface DeliveryRecord {
@@ -66,6 +120,16 @@ const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 // inference.net retries 5xx itself, so keep S3 retries short: the whole
 // request must finish inside the platform's 30 second delivery timeout.
 const S3_RETRIES = 3;
+
+// A failed copy to S3 waits 30 s, then twice as long each time, up to 1 hour. After 20 attempts
+// (about 14 hours) the message goes to the dead letter queue; the staged object stays in R2.
+const RETRY_BASE_SECONDS = 30;
+const RETRY_MAX_SECONDS = 3600;
+
+// Every minute, the sweep re-queues staged objects older than 15 minutes: their message was lost,
+// dead-lettered, or is waiting out a long retry delay. It lists at most 10,000 staged objects per run.
+const SWEEP_AFTER_MS = 15 * 60_000;
+const SWEEP_PAGES = 10;
 
 const LAST_DELIVERY_KEY = "last-delivery";
 const LAST_ERROR_KEY = "last-error";
@@ -103,6 +167,52 @@ export default {
     }
     return handleDelivery(request, env, ctx);
   },
+
+  /** Buffered mode: copies staged deliveries to S3. */
+  async queue(batch: { messages: readonly QueueMessage[] }, env: Env): Promise<void> {
+    await Promise.all(
+      batch.messages.map(async (message) => {
+        const { key } = message.body;
+        const started = Date.now();
+        const result = await deliverStaged(env, key);
+        if (result.ok) {
+          message.ack();
+          log("log", { event: "delivered", key, result: result.message, attempts: message.attempts, ms: Date.now() - started });
+          return;
+        }
+        const delaySeconds = retryDelaySeconds(message.attempts);
+        message.retry({ delaySeconds });
+        log("warn", { event: "retry", key, attempts: message.attempts, delaySeconds, error: result.message });
+      }),
+    );
+  },
+
+  /**
+   * Buffered mode: re-queues staged objects older than 15 minutes, and logs the backlog. It first copies
+   * one of them itself, and re-queues the rest only when that works, so an S3 outage does not pile up messages.
+   */
+  async scheduled(_controller: unknown, env: Env): Promise<void> {
+    if (!env.STAGING || !env.DELIVERIES) {
+      return;
+    }
+    const queue = env.DELIVERIES;
+    const scan = await scanStaging(env.STAGING, SWEEP_PAGES, Date.now() - SWEEP_AFTER_MS);
+    const [first, ...rest] = scan.stale;
+    const probe = first ? await deliverStaged(env, first) : null;
+    if (probe?.ok) {
+      const chunks = Array.from({ length: Math.ceil(rest.length / 100) }, (_, index) => rest.slice(index * 100, index * 100 + 100));
+      await Promise.all(chunks.map((keys) => queue.sendBatch(keys.map((key) => ({ body: { key } })))));
+    }
+    log(probe && !probe.ok ? "warn" : "log", {
+      event: "sweep",
+      staged: scan.staged,
+      more: scan.more,
+      oldestStagedAt: scan.oldestStagedAt,
+      stale: scan.stale.length,
+      requeued: probe?.ok ? scan.stale.length : 0,
+      ...(probe && !probe.ok ? { error: probe.message } : {}),
+    });
+  },
 };
 
 /** Rejects a delivery: logs it, records it as the last error, and answers with `status`. */
@@ -115,7 +225,7 @@ function fail(env: Env, ctx: WorkerContext, request: Request, status: number, me
 
 async function handleDelivery(request: Request, env: Env, ctx: WorkerContext): Promise<Response> {
   const event = request.headers.get("x-inference-event");
-  const missing = REQUIRED_SETTINGS.filter((name) => !env[name]);
+  const missing = missingSettings(env);
   if (missing.length > 0) {
     return fail(env, ctx, request, 500, `Missing settings: ${missing.join(", ")}`);
   }
@@ -133,18 +243,30 @@ async function handleDelivery(request: Request, env: Env, ctx: WorkerContext): P
   }
 
   const body = await request.arrayBuffer();
-  // Written before the result, so a saved result with a failed request always has its marker.
-  if (hasFailure(body)) {
-    const marker = await putObject(env, `${prefix}failures/${key}`, "{}");
-    if (!marker.ok) {
-      return fail(env, ctx, request, 502, marker.message);
+  const marker = hasFailure(body) ? `${prefix}failures/${key}` : null;
+  if (env.STAGING && env.DELIVERIES) {
+    // The 200 below stops inference.net's retries, so answer it only after R2 and the queue both have the delivery.
+    try {
+      await env.STAGING.put(`${prefix}${key}`, body, { customMetadata: marker ? { marker } : {} });
+      await env.DELIVERIES.send({ key: `${prefix}${key}` });
+    } catch (error) {
+      return fail(env, ctx, request, 503, `Could not stage the delivery: ${String(error)}`);
     }
+    log("log", { event: "staged", key: `${prefix}${key}`, bytes: body.byteLength });
+  } else {
+    // Written before the result, so a saved result with a failed request always has its marker.
+    if (marker) {
+      const markerResult = await putObject(env, marker, "{}");
+      if (!markerResult.ok) {
+        return fail(env, ctx, request, 502, markerResult.message);
+      }
+    }
+    const result = await putObject(env, `${prefix}${key}`, body);
+    if (!result.ok) {
+      return fail(env, ctx, request, 502, result.message);
+    }
+    console.log(`Saved ${event} to ${prefix}${key}`);
   }
-  const result = await putObject(env, `${prefix}${key}`, body);
-  if (!result.ok) {
-    return fail(env, ctx, request, 502, result.message);
-  }
-  console.log(`Saved ${event} to ${prefix}${key}`);
   // Always record test deliveries (the dashboard's Test Webhook sends ids that start with "test-"), and
   // the first success after an error, so `status` does not keep showing an error that is fixed.
   const always =
@@ -155,17 +277,26 @@ async function handleDelivery(request: Request, env: Env, ctx: WorkerContext): P
   return reply(200, `${prefix}${key}`);
 }
 
+/** Required settings that are empty, plus the other half of the buffered-mode binding pair. */
+function missingSettings(env: Env): string[] {
+  const missing: string[] = REQUIRED_SETTINGS.filter((name) => !env[name]);
+  if (env.STAGING && !env.DELIVERIES) missing.push("DELIVERIES");
+  if (env.DELIVERIES && !env.STAGING) missing.push("STAGING");
+  return missing;
+}
+
 async function workerStatus(env: Env, probe: boolean): Promise<WorkerStatus> {
-  const missingSettings = REQUIRED_SETTINGS.filter((name) => !env[name]);
+  const missing = missingSettings(env);
   const prefix = env.S3_KEY_PREFIX ?? "";
   const canProbe =
-    probe && SAFE_KEY_PREFIX.test(prefix) && !missingSettings.some((name) => name.startsWith("S3_"));
+    probe && SAFE_KEY_PREFIX.test(prefix) && !missing.some((name) => name.startsWith("S3_"));
   const probeKey = `${prefix}tests/status-probe.json`;
   const probeResult = canProbe
     ? await putObject(env, probeKey, JSON.stringify({ probe: true, at: new Date().toISOString() }))
     : null;
+  const scan = env.STAGING ? await scanStaging(env.STAGING, 1, 0) : null;
   return {
-    missingSettings,
+    missingSettings: missing,
     bucket: env.S3_BUCKET || null,
     region: env.S3_REGION || null,
     keyPrefix: prefix,
@@ -174,27 +305,93 @@ async function workerStatus(env: Env, probe: boolean): Promise<WorkerStatus> {
     lastDelivery: await readRecord<DeliveryRecord>(env, LAST_DELIVERY_KEY),
     lastError: await readRecord<ErrorRecord>(env, LAST_ERROR_KEY),
     probe: probeResult && { key: probeKey, ...probeResult },
+    buffer: scan && { staged: scan.staged, more: scan.more, oldestStagedAt: scan.oldestStagedAt },
   };
+}
+
+/**
+ * Copies one staged delivery to S3 (its failure marker first), then deletes it from R2. Never throws.
+ * A missing object was already delivered, so it counts as success. S3 checks the body against the MD5
+ * that R2 computed when the delivery was staged.
+ */
+export async function deliverStaged(env: Env, key: string): Promise<{ ok: boolean; message: string }> {
+  const staging = env.STAGING;
+  if (!staging) {
+    return { ok: false, message: "STAGING is not bound" };
+  }
+  try {
+    const staged = await staging.get(key);
+    if (!staged) {
+      return { ok: true, message: "already delivered" };
+    }
+    const marker = staged.customMetadata?.marker;
+    const markerResult = marker ? await putObject(env, marker, "{}") : null;
+    if (markerResult && !markerResult.ok) {
+      await staged.body.cancel();
+      return markerResult;
+    }
+    const md5 = staged.checksums.md5;
+    const result = await putObject(env, key, staged.body, md5 ? { "Content-MD5": base64(md5) } : {});
+    if (!result.ok) {
+      return result;
+    }
+    // A delivery staged again under this key while this copy ran has its own queue message, so leave it.
+    if ((await staging.head(key))?.etag === staged.etag) {
+      await staging.delete(key);
+    }
+    return { ok: true, message: "OK" };
+  } catch (error) {
+    return { ok: false, message: String(error) };
+  }
+}
+
+/** Lists up to `pages` pages of staged objects: how many, the oldest, and the keys staged before `staleBefore`. */
+async function scanStaging(
+  staging: StagingBucket,
+  pages: number,
+  staleBefore: number,
+): Promise<BufferStatus & { stale: string[] }> {
+  let staged = 0;
+  let oldest: Date | null = null;
+  const stale: string[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < pages; page++) {
+    const listed = await staging.list({ limit: 1000, cursor });
+    for (const { key, uploaded } of listed.objects) {
+      staged++;
+      if (!oldest || uploaded < oldest) oldest = uploaded;
+      if (uploaded.getTime() < staleBefore) stale.push(key);
+    }
+    cursor = listed.truncated ? listed.cursor : undefined;
+    if (!cursor) break;
+  }
+  return { staged, more: cursor !== undefined, oldestStagedAt: oldest?.toISOString() ?? null, stale };
+}
+
+export function retryDelaySeconds(attempts: number): number {
+  return Math.min(RETRY_BASE_SECONDS * 2 ** Math.max(attempts - 1, 0), RETRY_MAX_SECONDS);
 }
 
 /** PUTs one object. Never throws; the message says what S3 answered. */
 async function putObject(
   env: Env,
   key: string,
-  body: ArrayBuffer | string,
+  body: ArrayBuffer | string | ReadableStream,
+  headers: Record<string, string> = {},
 ): Promise<{ ok: boolean; status: number; message: string }> {
   const s3 = new AwsClient({
     accessKeyId: env.S3_ACCESS_KEY_ID,
     secretAccessKey: env.S3_SECRET_ACCESS_KEY,
     service: "s3",
     region: env.S3_REGION,
-    retries: S3_RETRIES,
+    // A stream can be sent only once; the queue retries a failed copy instead.
+    retries: body instanceof ReadableStream ? 0 : S3_RETRIES,
   });
   const url = objectUrl(env, key);
   try {
     const response = await s3.fetch(url, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...headers },
       body,
     });
     if (response.ok) {
@@ -288,6 +485,15 @@ async function safeEqual(a: string, b: string): Promise<boolean> {
     diff |= byte ^ (y[index] ?? 0);
   });
   return diff === 0;
+}
+
+/** One JSON log line, which Workers Logs indexes by field. */
+function log(level: "log" | "warn", fields: Record<string, unknown>): void {
+  console[level](JSON.stringify(fields));
+}
+
+function base64(bytes: ArrayBuffer): string {
+  return btoa(String.fromCharCode(...new Uint8Array(bytes)));
 }
 
 function reply(status: number, body: string): Response {
