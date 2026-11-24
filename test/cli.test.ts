@@ -824,12 +824,15 @@ describe("buffered mode", () => {
     expect(result.checks.find(({ check }) => check === "buffer")).toMatchObject({ ok: false, detail: expect.stringMatching(/^12 accepted/) });
   });
 
-  it("destroy deletes the queues, and keeps an R2 bucket that still holds deliveries", async () => {
+  it("destroy detaches the consumer before it deletes the Worker, then deletes the queues, and keeps an R2 bucket that still holds deliveries", async () => {
     await store.write({ ...(await seed()), buffer });
     const { wrangler, calls } = fakeWrangler({ "r2 bucket": { code: 1, stderr: "The bucket you tried to delete is not empty. [code: 10008]" } });
     const deps = makeDeps({ wrangler });
     await commands.destroy(deps, "my-results", { yes: true });
-    expect(calls.slice(2).map(({ args }) => args)).toEqual([
+    expect(calls.map(({ args }) => args)).toEqual([
+      ["queues", "consumer", "remove", buffer.queue, "my-results"],
+      ["delete", "my-results"],
+      ["kv", "namespace", "delete", "--namespace-id", NAMESPACE_ID, "--skip-confirmation"],
       ["queues", "delete", buffer.queue],
       ["queues", "delete", buffer.deadLetterQueue],
       ["r2", "bucket", "delete", buffer.bucket],

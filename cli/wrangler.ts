@@ -101,6 +101,14 @@ export async function deleteResource(
   throw wranglerError(`Could not delete ${kind === "queues" ? "queue" : "R2 bucket"} ${name}`, result);
 }
 
+/** Detaches a Worker from a queue it consumes. Cloudflare refuses to delete a Worker that is still a consumer. */
+export async function removeQueueConsumer(wrangler: Wrangler, queue: string, worker: string, accountId: string): Promise<void> {
+  const result = await wrangler(["queues", "consumer", "remove", queue, worker], { accountId });
+  if (result.code !== 0 && !/does not exist|No worker consumer/i.test(result.stderr + result.stdout)) {
+    throw wranglerError(`Could not detach Worker ${worker} from queue ${queue}`, result);
+  }
+}
+
 /** Deploys the Worker described by a Wrangler config file and returns its workers.dev URL. */
 export async function deployWorker(wrangler: Wrangler, configPath: string, accountId: string): Promise<string> {
   const result = await wrangler(["deploy", "--config", configPath], { accountId });

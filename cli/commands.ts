@@ -13,6 +13,7 @@ import {
   deleteNamespace,
   deleteResource,
   deleteWorker,
+  removeQueueConsumer,
   deployWorker,
   putSecrets,
   whoami,
@@ -600,13 +601,14 @@ export async function destroy(deps: Deps, name: string, options: { yes?: boolean
     webhook = await remote.api.delete(remote.id);
     out.ok(webhook === "deleted" ? "Webhook deleted" : "Webhook was already gone");
   }
+  const buffer = deployment.buffer;
   out.step("Deleting the Worker");
+  if (buffer) await removeQueueConsumer(deps.wrangler, buffer.queue, name, deployment.accountId);
   const worker = await deleteWorker(deps.wrangler, name, deployment.accountId);
   out.ok(worker === "deleted" ? "Worker deleted" : "Worker was already gone");
   out.step("Deleting the status KV namespace");
   await deleteNamespace(deps.wrangler, deployment.statusNamespaceId, deployment.accountId);
   out.ok("KV namespace deleted");
-  const buffer = deployment.buffer;
   if (buffer) {
     out.step("Deleting the queues and the R2 staging bucket");
     await Promise.all([
