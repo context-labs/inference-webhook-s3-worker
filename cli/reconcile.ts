@@ -547,7 +547,7 @@ async function main(): Promise<void> {
   const started = Date.now();
   const counts = await reconcile(options, source, items, checkpoint?.counts);
   const seconds = (Date.now() - started) / 1000;
-  console.log(JSON.stringify({ ...counts, dryRun: options.dryRun, seconds, groupsPerSecond: Math.round(counts.checked / Math.max(seconds, 0.001)) }));
+  console.log(JSON.stringify({ ...counts, dryRun: options.dryRun, seconds, groupsPerSecond: Math.round((counts.checked - (checkpoint?.counts.checked ?? 0)) / Math.max(seconds, 0.001)) }));
   // 1 while anything is left to fix: a failure, or (with --dry-run) a missing object.
   if (counts.failed > 0 || counts.missing > counts.repaired) process.exitCode = 1;
 }
