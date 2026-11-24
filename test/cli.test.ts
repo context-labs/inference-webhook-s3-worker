@@ -64,6 +64,7 @@ function healthyStatus(overrides: Partial<WorkerStatus> = {}): WorkerStatus {
     lastDelivery: { at: "2026-01-01T00:00:00.000Z", event: "webhook.test", key: "embeddings/tests/webhook-test.json" },
     lastError: null,
     probe: { ok: true, key: "embeddings/tests/status-probe.json", status: 200, message: "OK" },
+    buffer: null,
     ...overrides,
   };
 }
@@ -776,5 +777,65 @@ describe("CLI process", () => {
     expect(result.stdout).not.toMatch(/\u001b\[/);
     expect(result.status).toBe(1);
     expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, fix: expect.stringContaining("list") });
+  });
+});
+
+describe("buffered mode", () => {
+  const buffer = { bucket: "my-results-staging", queue: "my-results-deliveries", deadLetterQueue: "my-results-deliveries-dlq" };
+
+  it("update --buffered creates the bucket and queues, then deploys with their bindings and the sweep", async () => {
+    await seed();
+    const { wrangler, calls } = fakeWrangler({ "queues create": { code: 1, stderr: "Queue name is already taken. [code: 11009]" } });
+    const result = await commands.update(makeDeps({ wrangler }), "my-results", { buffered: true });
+
+    expect(result).toMatchObject({ ok: true, buffered: true });
+    expect(calls.slice(0, 3).map(({ args }) => args)).toEqual([
+      ["r2", "bucket", "create", buffer.bucket],
+      ["queues", "create", buffer.queue],
+      ["queues", "create", buffer.deadLetterQueue],
+    ]);
+    expect((await store.read("my-results"))?.buffer).toEqual(buffer);
+    const config = JSON.parse(await readFile(store.wranglerConfigPath("my-results"), "utf8"));
+    expect(config).toMatchObject({
+      kv_namespaces: [{ binding: "STATUS", id: NAMESPACE_ID }],
+      r2_buckets: [{ binding: "STAGING", bucket_name: buffer.bucket }],
+      queues: {
+        producers: [{ binding: "DELIVERIES", queue: buffer.queue }],
+        consumers: [{ queue: buffer.queue, max_retries: 20, dead_letter_queue: buffer.deadLetterQueue }],
+      },
+      triggers: { crons: ["* * * * *"] },
+    });
+  });
+
+  it("update without --buffered keeps a Worker in direct mode", async () => {
+    await seed();
+    const { wrangler, calls } = fakeWrangler();
+    await commands.update(makeDeps({ wrangler }), "my-results");
+    expect(calls.map(({ args }) => args[0])).toEqual(["deploy"]);
+    expect(JSON.parse(await readFile(store.wranglerConfigPath("my-results"), "utf8"))).not.toHaveProperty("queues");
+  });
+
+  it("status fails when a staged delivery has waited over 30 minutes", async () => {
+    await seed();
+    const { wrangler } = fakeWrangler({ "deployments status": { code: 0, stdout: "{}" } });
+    const stuck = healthyStatus({ buffer: { staged: 12, more: false, oldestStagedAt: "2025-12-31T23:00:00.000Z" } });
+    const result = await commands.status(makeDeps({ wrangler, fetch: vi.fn(async () => Response.json(stuck)) }), "my-results");
+    expect(result.ok).toBe(false);
+    expect(result.checks.find(({ check }) => check === "buffer")).toMatchObject({ ok: false, detail: expect.stringMatching(/^12 accepted/) });
+  });
+
+  it("destroy detaches the consumer before it deletes the Worker, then deletes the queues, and keeps an R2 bucket that still holds deliveries", async () => {
+    await store.write({ ...(await seed()), buffer });
+    const { wrangler, calls } = fakeWrangler({ "r2 bucket": { code: 1, stderr: "The bucket you tried to delete is not empty. [code: 10008]" } });
+    const deps = makeDeps({ wrangler });
+    await commands.destroy(deps, "my-results", { yes: true });
+    expect(calls.map(({ args }) => args)).toEqual([
+      ["queues", "consumer", "remove", buffer.queue, "my-results"],
+      ["delete", "my-results"],
+      ["kv", "namespace", "delete", "--namespace-id", NAMESPACE_ID, "--skip-confirmation"],
+      ["queues", "delete", buffer.queue],
+      ["queues", "delete", buffer.deadLetterQueue],
+      ["r2", "bucket", "delete", buffer.bucket],
+    ]);
   });
 });

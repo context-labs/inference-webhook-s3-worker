@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
+
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import worker, { type Env, hasFailure, objectKey } from "../src/index";
+import worker, { type Env, hasFailure, objectKey, retryDelaySeconds } from "../src/index";
 
 const env: Env = {
   WEBHOOK_PATH_SECRET: "path-secret",
@@ -132,13 +134,25 @@ describe("hasFailure", () => {
     ["a failed generation event", { event: "async-embedding.completed", data: generation("Failed") }, true],
     ["a successful generation event", { event: "async-embedding.completed", data: generation("Success") }, false],
     ["the words inside a string value", group("completed", generation("Success", { note: '"state":"Failed"' })), false],
-  ])("%s -> %s", (_, payload, expected) => {
-    expect(hasFailure(encode(payload))).toBe(expected);
+  ])("%s -> %s", async (_, payload, expected) => {
+    expect(await hasFailure(encode(payload))).toBe(expected);
   });
 
-  it("allows whitespace around the colon", () => {
+  it("finds a failure split across stream chunks", async () => {
+    const chunks = ['{"pad":"xx","sta', 'te"  :', ' "Fail', 'ed"}'].map((chunk) => new TextEncoder().encode(chunk));
+    const stream = new ReadableStream({
+      pull(controller) {
+        const chunk = chunks.shift();
+        if (chunk) controller.enqueue(chunk);
+        else controller.close();
+      },
+    });
+    expect(await hasFailure(stream)).toBe(true);
+  });
+
+  it("allows whitespace around the colon", async () => {
     const text = new TextEncoder().encode(JSON.stringify(group("completed", generation("Failed")), null, 2)).buffer;
-    expect(hasFailure(text)).toBe(true);
+    expect(await hasFailure(text)).toBe(true);
   });
 });
 
@@ -326,5 +340,203 @@ describe("status route", () => {
     await Promise.all(pending);
     expect(oldUrl.status).toBe(404);
     expect(JSON.parse(store.data.get("last-error") ?? "null")).toMatchObject({ status: 404, event: "slow-group.completed" });
+  });
+});
+
+describe("buffered mode", () => {
+  function r2() {
+    const objects = new Map<string, { bytes: Uint8Array<ArrayBuffer>; uploaded: Date; etag: string }>();
+    let version = 0;
+    const bucket = {
+      objects,
+      put: vi.fn(async (key: string, value: ReadableStream | ArrayBuffer | null) => {
+        const bytes = new Uint8Array(await new Response(value).arrayBuffer());
+        objects.set(key, { bytes, uploaded: new Date(), etag: `etag-${++version}` });
+      }),
+      get: vi.fn(async (key: string) => {
+        const object = objects.get(key);
+        if (!object) return null;
+        const md5 = createHash("md5").update(object.bytes).digest();
+        return {
+          etag: object.etag,
+          body: new Response(object.bytes).body as ReadableStream,
+          checksums: { md5: md5.buffer.slice(md5.byteOffset, md5.byteOffset + md5.byteLength) },
+        };
+      }),
+      head: vi.fn(async (key: string) => objects.get(key) ?? null),
+      delete: vi.fn(async (key: string) => {
+        objects.delete(key);
+      }),
+      list: vi.fn(async ({ limit, cursor }: { limit: number; cursor?: string }) => {
+        const keys = [...objects.keys()].sort();
+        const start = cursor ? Number(cursor) : 0;
+        const page = keys.slice(start, start + limit);
+        const truncated = start + limit < keys.length;
+        return {
+          objects: page.map((key) => ({ key, uploaded: objects.get(key)!.uploaded })),
+          truncated,
+          cursor: truncated ? String(start + limit) : undefined,
+        };
+      }),
+    };
+    return bucket;
+  }
+
+  function queue() {
+    return { send: vi.fn(async () => {}), sendBatch: vi.fn(async () => {}) };
+  }
+
+  function message(key: string, attempts = 1) {
+    return { body: { key }, attempts, ack: vi.fn(), retry: vi.fn() };
+  }
+
+  function buffered() {
+    const staging = r2();
+    const deliveries = queue();
+    return { staging, deliveries, env: { ...env, STAGING: staging, DELIVERIES: deliveries } };
+  }
+
+  it("stages the body under the final key, queues it, and returns 200 without calling S3", async () => {
+    const fetchMock = mockS3();
+    const { staging, deliveries, env: bufferedEnv } = buffered();
+    const response = await worker.fetch(delivery(), bufferedEnv, ctx);
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("embeddings/groups/grp_123.json");
+    expect(new TextDecoder().decode(staging.objects.get("embeddings/groups/grp_123.json")?.bytes)).toBe(groupBody);
+    expect(deliveries.send).toHaveBeenCalledWith({ key: "embeddings/groups/grp_123.json" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("streams a body with Content-Length into R2 instead of reading it into memory", async () => {
+    const { staging, env: bufferedEnv } = buffered();
+    const response = await worker.fetch(delivery({ headers: { "Content-Length": String(groupBody.length) } }), bufferedEnv, ctx);
+    expect(response.status).toBe(200);
+    expect(staging.put.mock.calls[0]?.[1]).toBeInstanceOf(ReadableStream);
+  });
+
+  it.each(["put", "send"] as const)("returns 503 when the R2 %s fails, so inference.net retries", async (step) => {
+    const { staging, deliveries, env: bufferedEnv } = buffered();
+    (step === "put" ? staging.put : deliveries.send).mockRejectedValueOnce(new Error("unavailable"));
+    const response = await worker.fetch(delivery(), bufferedEnv, ctx);
+    expect(response.status).toBe(503);
+    expect(await response.text()).toContain("unavailable");
+  });
+
+  it("returns 500 when only one of the two bindings is present", async () => {
+    const response = await worker.fetch(delivery(), { ...env, STAGING: r2() }, ctx);
+    expect(response.status).toBe(500);
+    expect(await response.text()).toBe("Missing settings: DELIVERIES");
+  });
+
+  it("consumer: writes the marker, then the body with its MD5, deletes the staged copy, and acks", async () => {
+    const { staging, env: bufferedEnv } = buffered();
+    const body = JSON.stringify({ event: "slow-group.completed", data: { status: "failed", generations: [] } });
+    await worker.fetch(delivery({ body }), bufferedEnv, ctx);
+    const fetchMock = mockS3(new Response(null, { status: 200 }), new Response(null, { status: 200 }));
+    const msg = message("embeddings/groups/grp_123.json");
+
+    await worker.queue({ messages: [msg] }, bufferedEnv);
+
+    const [marker, result] = fetchMock.mock.calls.map(([request]) => request as Request);
+    expect(marker?.url).toBe("https://results.s3.us-east-1.amazonaws.com/embeddings/failures/groups/grp_123.json");
+    expect(result?.url).toBe("https://results.s3.us-east-1.amazonaws.com/embeddings/groups/grp_123.json");
+    expect(result?.headers.get("content-md5")).toBe(createHash("md5").update(body).digest("base64"));
+    expect(await result?.text()).toBe(body);
+    expect(staging.objects.size).toBe(0);
+    expect(msg.ack).toHaveBeenCalled();
+    expect(msg.retry).not.toHaveBeenCalled();
+  });
+
+  it("consumer: copies at most three deliveries at once, so S3 writes always get a connection", async () => {
+    const { env: bufferedEnv } = buffered();
+    const ids = Array.from({ length: 10 }, (_, index) => `grp_${index}`);
+    for (const id of ids) await worker.fetch(delivery({ headers: { "X-Inference-Group-ID": id } }), bufferedEnv, ctx);
+    let open = 0;
+    let most = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      most = Math.max(most, ++open);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      open--;
+      return new Response(null, { status: 200 });
+    });
+    const messages = ids.map((id) => message(`embeddings/groups/${id}.json`));
+
+    await worker.queue({ messages }, bufferedEnv);
+
+    expect(most).toBe(3);
+    expect(messages.every((msg) => msg.ack.mock.calls.length === 1)).toBe(true);
+  });
+
+  it("consumer: keeps the staged copy and retries with backoff when S3 fails", async () => {
+    const { staging, env: bufferedEnv } = buffered();
+    await worker.fetch(delivery(), bufferedEnv, ctx);
+    const fetchMock = mockS3(new Response("<Error><Code>AccessDenied</Code></Error>", { status: 403 }));
+    const msg = message("embeddings/groups/grp_123.json", 3);
+
+    await worker.queue({ messages: [msg] }, bufferedEnv);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(staging.objects.size).toBe(1);
+    expect(msg.ack).not.toHaveBeenCalled();
+    expect(msg.retry).toHaveBeenCalledWith({ delaySeconds: 120 });
+  });
+
+  it("consumer: acks a message whose object was already delivered, without calling S3", async () => {
+    const fetchMock = mockS3();
+    const { env: bufferedEnv } = buffered();
+    const msg = message("embeddings/groups/gone.json");
+    await worker.queue({ messages: [msg] }, bufferedEnv);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(msg.ack).toHaveBeenCalled();
+  });
+
+  it("consumer: keeps a delivery that was staged again while the copy ran", async () => {
+    const { staging, env: bufferedEnv } = buffered();
+    await worker.fetch(delivery(), bufferedEnv, ctx);
+    vi.spyOn(globalThis, "fetch").mockImplementationOnce(async () => {
+      await worker.fetch(delivery(), bufferedEnv, ctx);
+      return new Response(null, { status: 200 });
+    });
+    await worker.queue({ messages: [message("embeddings/groups/grp_123.json")] }, bufferedEnv);
+    expect(staging.objects.get("embeddings/groups/grp_123.json")?.etag).toBe("etag-2");
+  });
+
+  it("sweep: copies one stale object itself, then re-queues the other stale ones", async () => {
+    const { staging, deliveries, env: bufferedEnv } = buffered();
+    const old = new Date(Date.now() - 20 * 60_000);
+    for (const id of ["a", "b", "c"]) await worker.fetch(delivery({ headers: { "X-Inference-Group-ID": id } }), bufferedEnv, ctx);
+    staging.objects.get("embeddings/groups/a.json")!.uploaded = old;
+    staging.objects.get("embeddings/groups/b.json")!.uploaded = old;
+    mockS3(new Response(null, { status: 200 }));
+
+    await worker.scheduled({}, bufferedEnv);
+
+    expect([...staging.objects.keys()]).toEqual(["embeddings/groups/b.json", "embeddings/groups/c.json"]);
+    expect(deliveries.sendBatch).toHaveBeenCalledWith([{ body: { key: "embeddings/groups/b.json" } }]);
+  });
+
+  it("sweep: re-queues nothing while S3 still fails", async () => {
+    const { staging, deliveries, env: bufferedEnv } = buffered();
+    await worker.fetch(delivery(), bufferedEnv, ctx);
+    staging.objects.get("embeddings/groups/grp_123.json")!.uploaded = new Date(0);
+    mockS3(new Response(null, { status: 403 }));
+
+    await worker.scheduled({}, bufferedEnv);
+
+    expect(staging.objects.size).toBe(1);
+    expect(deliveries.sendBatch).not.toHaveBeenCalled();
+  });
+
+  it("status reports the staged count and the oldest staged object", async () => {
+    const { staging, env: bufferedEnv } = buffered();
+    await worker.fetch(delivery(), bufferedEnv, ctx);
+    staging.objects.get("embeddings/groups/grp_123.json")!.uploaded = new Date("2026-01-01T00:00:00.000Z");
+    const response = await worker.fetch(new Request("https://worker.example.com/path-secret/status"), bufferedEnv, ctx);
+    expect((await response.json()).buffer).toEqual({ staged: 1, more: false, oldestStagedAt: "2026-01-01T00:00:00.000Z" });
+  });
+
+  it("retry delay doubles from 30 seconds up to 1 hour", () => {
+    expect([1, 2, 3, 7, 8, 20].map(retryDelaySeconds)).toEqual([30, 60, 120, 1920, 3600, 3600]);
   });
 });

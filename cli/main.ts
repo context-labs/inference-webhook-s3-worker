@@ -208,8 +208,9 @@ program
   .summary("deploy the code in this folder to the Worker")
   .description("Deploy the code in this folder to the Worker, for example after git pull, and check it again.")
   .argument("<name>", "Worker name")
-  .addHelpText("after", examples(["Deploy the latest code", "update my-results"]))
-  .action(run((d, name: string) => commands.update(d, name)));
+  .option("--buffered", "turn on buffered mode: create an R2 staging bucket and a queue, and answer inference.net once a delivery is staged")
+  .addHelpText("after", examples(["Deploy the latest code", "update my-results"], ["Turn on buffered mode", "update my-results --buffered"]))
+  .action(run((d, name: string, options: { buffered?: boolean }) => commands.update(d, name, options)));
 
 program
   .command("list")

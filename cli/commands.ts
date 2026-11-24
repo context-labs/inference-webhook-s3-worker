@@ -6,11 +6,14 @@ import { InferenceApi, type Webhook } from "./inference.ts";
 import { CliError, cli, code, exec, install, type Output } from "./output.ts";
 import type { Prompter } from "./prompt.ts";
 import { bucketRegion, probeS3Write, type S3Keys } from "./s3.ts";
-import { type Deployment, type LocalSecrets, type S3Settings, type StateStore, workerNameError } from "./state.ts";
+import { type BufferResources, type Deployment, type LocalSecrets, type S3Settings, type StateStore, workerNameError } from "./state.ts";
 import {
+  createResource,
   createStatusNamespace,
   deleteNamespace,
+  deleteResource,
   deleteWorker,
+  removeQueueConsumer,
   deployWorker,
   putSecrets,
   whoami,
@@ -42,6 +45,8 @@ const SETTINGS_RETRY_DELAYS_MS = [5_000, 10_000, 15_000, 30_000];
 // A new Worker can take about 3 minutes before Cloudflare lets wrangler turn on its workers.dev URL.
 const DEPLOY_ATTEMPTS = 12;
 const DEPLOY_RETRY_MS = 20_000;
+/** `status` fails when a staged delivery has waited this long for S3. */
+const BUFFER_STUCK_MS = 30 * 60_000;
 
 export type Storage = "aws" | "r2" | "other";
 
@@ -305,6 +310,21 @@ export async function status(deps: Deps, name: string) {
       },
       true,
     );
+    const buffer = workerStatus.buffer;
+    if (buffer) {
+      const stuck = buffer.oldestStagedAt !== null && deps.now().getTime() - Date.parse(buffer.oldestStagedAt) > BUFFER_STUCK_MS;
+      add({
+        check: "buffer",
+        ok: !stuck,
+        detail:
+          buffer.oldestStagedAt === null
+            ? "Buffer empty: every accepted delivery is in S3"
+            : `${buffer.more ? "More than " : ""}${buffer.staged} accepted deliveries waiting for S3, oldest staged ${ago(deps, buffer.oldestStagedAt)}`,
+        fix: stuck
+          ? `Copies to S3 keep failing. The S3 check above shows why; ${cli(`logs ${name}`)} shows each retry. They stay in R2 and resume once S3 works.`
+          : null,
+      });
+    }
     // An error newer than the last saved delivery means deliveries fail now, and inference.net is retrying them.
     const error = workerStatus.lastError;
     if (error && (!last || error.at > last.at)) {
@@ -380,7 +400,11 @@ export async function test(deps: Deps, name: string, options: { remote?: boolean
   if (response.status !== 200) {
     throw new CliError(`The Worker answered HTTP ${response.status}: ${body}`, errorFix(name, response.status));
   }
-  out.ok(`S3 accepted ${deployment.s3.bucket}/${body} (the Worker answers 200 only after S3 confirms the write)`);
+  out.ok(
+    deployment.buffer
+      ? `Staged ${body} for ${deployment.s3.bucket} (buffered mode: the queue copies it to S3 within seconds)`
+      : `S3 accepted ${deployment.s3.bucket}/${body} (the Worker answers 200 only after S3 confirms the write)`,
+  );
   out.next(cli(`status ${name}`), cli(`logs ${name}`));
   const result = { ok: true, name, bucket: deployment.s3.bucket, key: body };
   out.result(result);
@@ -499,17 +523,43 @@ export async function config(deps: Deps, name: string, options: ConfigOptions) {
   return result;
 }
 
-/** `update`: deploys the code in this folder (for example after `git pull`) to an existing Worker. */
-export async function update(deps: Deps, name: string) {
-  const { deployment, secrets } = await load(deps, name);
+/**
+ * `update`: deploys the code in this folder (for example after `git pull`) to an existing Worker. With
+ * `buffered`, it first creates the R2 staging bucket and the queues, and the deploy turns buffered mode on.
+ */
+export async function update(deps: Deps, name: string, options: { buffered?: boolean } = {}) {
+  let { deployment, secrets } = await load(deps, name);
   deps.out.heading(`Update ${name}`);
+  if (options.buffered && !deployment.buffer) {
+    const buffer = bufferResources(name);
+    deps.out.step(`Creating R2 bucket ${buffer.bucket}, queue ${buffer.queue}, and dead letter queue ${buffer.deadLetterQueue}`);
+    await Promise.all([
+      createResource(deps.wrangler, "r2 bucket", buffer.bucket, deployment.accountId),
+      createResource(deps.wrangler, "queues", buffer.queue, deployment.accountId),
+      createResource(deps.wrangler, "queues", buffer.deadLetterQueue, deployment.accountId),
+    ]);
+    deployment = { ...deployment, buffer };
+    await deps.store.write(deployment);
+    deps.out.ok("Created. The deploy below turns buffered mode on; object keys in S3 stay the same.");
+  }
   const updated = await deploy(deps, deployment);
   deps.out.step("Checking the Worker");
   checkProbe(deps.out, name, await waitForWorker(deps, updated, secrets));
   deps.out.next(cli(`status ${name}`));
-  const result = { ok: true, name, url: updated.url };
+  const result = { ok: true, name, url: updated.url, buffered: Boolean(updated.buffer) };
   deps.out.result(result);
   return result;
+}
+
+function bufferResources(name: string): BufferResources {
+  // R2 bucket and queue names allow at most 63 characters.
+  if (name.length > 48) {
+    throw new CliError(
+      `Buffered mode names its queues ${name}-deliveries and ${name}-deliveries-dlq, which is too long for a Worker name over 48 characters.`,
+      "Set up a Worker with a shorter name, or turn on buffered mode by hand (see the README).",
+    );
+  }
+  return { bucket: `${name}-staging`, queue: `${name}-deliveries`, deadLetterQueue: `${name}-deliveries-dlq` };
 }
 
 /** `list`: the Workers set up from this folder. */
@@ -551,12 +601,29 @@ export async function destroy(deps: Deps, name: string, options: { yes?: boolean
     webhook = await remote.api.delete(remote.id);
     out.ok(webhook === "deleted" ? "Webhook deleted" : "Webhook was already gone");
   }
+  const buffer = deployment.buffer;
   out.step("Deleting the Worker");
+  if (buffer) await removeQueueConsumer(deps.wrangler, buffer.queue, name, deployment.accountId);
   const worker = await deleteWorker(deps.wrangler, name, deployment.accountId);
   out.ok(worker === "deleted" ? "Worker deleted" : "Worker was already gone");
   out.step("Deleting the status KV namespace");
   await deleteNamespace(deps.wrangler, deployment.statusNamespaceId, deployment.accountId);
   out.ok("KV namespace deleted");
+  if (buffer) {
+    out.step("Deleting the queues and the R2 staging bucket");
+    await Promise.all([
+      deleteResource(deps.wrangler, "queues", buffer.queue, deployment.accountId),
+      deleteResource(deps.wrangler, "queues", buffer.deadLetterQueue, deployment.accountId),
+    ]);
+    if ((await deleteResource(deps.wrangler, "r2 bucket", buffer.bucket, deployment.accountId)) === "not empty") {
+      out.warn(
+        `Kept R2 bucket ${buffer.bucket}: it holds accepted deliveries that are not in S3 yet.`,
+        `Copy them to S3 yourself, or delete them with the bucket in the Cloudflare dashboard.`,
+      );
+    } else {
+      out.ok("Queues and R2 bucket deleted");
+    }
+  }
   await deps.store.remove(name);
   out.ok("Local state removed");
   out.info(`\nObjects in ${deployment.s3.bucket}/${deployment.s3.keyPrefix} were not touched.`);
@@ -797,7 +864,7 @@ async function remoteTestDelivery(
     );
     return false;
   }
-  deps.out.ok("inference.net sent it, and the Worker answered HTTP 200 after S3 stored it");
+  deps.out.ok(`inference.net sent it, and the Worker answered HTTP 200 after ${deployment.buffer ? "staging it for S3" : "S3 stored it"}`);
   return waitForTestDelivery(deps, deployment, secrets, since);
 }
 

@@ -227,6 +227,117 @@ my-embeddings is healthy.
 
 </details>
 
+## Buffered mode
+
+By default the Worker answers inference.net only after S3 has the object. In buffered mode it answers once the delivery is safe in Cloudflare, and a queue copies it to S3:
+
+```text
+inference.net ──POST──▶ Worker ──put──▶ R2 staging bucket ─┐
+                          │                                  │ queue consumer: copy to S3, then delete from R2
+                          └──send {key}──▶ Queue ────────────┘
+```
+
+Use it when S3 is slow or can be down for longer than inference.net retries (about 3 days), or when you want deliveries acknowledged in about a second whatever S3 does.
+
+- **The Worker answers `200` only after R2 and the queue both have the delivery.** If either fails, it answers `503`, and inference.net retries.
+- **Same objects in S3.** The staged object has the final key and the exact body. The consumer writes the same `<prefix>groups/<id>.json` and `failures/` markers as direct mode, and S3 checks every body against its MD5.
+- **No duplicates.** Keys come from ids, so a repeated delivery or message overwrites the same object.
+- **Nothing is deleted before S3 has it.** The staged copy stays in R2 until the S3 write succeeds.
+
+### Turn it on
+
+For a Worker that `setup` created, from this folder:
+
+```sh
+git pull
+npm ci
+npm run cli -- update <name> --buffered
+```
+
+`update --buffered` creates the R2 bucket `<name>-staging`, the queue `<name>-deliveries` and the dead letter queue `<name>-deliveries-dlq`, then deploys. You need no data migration and no downtime, and the object keys stay the same. A delivery that the old version is still handling finishes in direct mode. Run it again at any time: resources that already exist are kept.
+
+<details>
+<summary><b>Without the CLI</b></summary>
+
+1. Create the resources:
+
+   ```sh
+   npx wrangler r2 bucket create inference-webhook-s3-worker-staging
+   npx wrangler queues create inference-webhook-s3-worker-deliveries
+   npx wrangler queues create inference-webhook-s3-worker-deliveries-dlq
+   ```
+
+2. Add the bindings to `wrangler.jsonc`:
+
+   ```jsonc
+   "r2_buckets": [{ "binding": "STAGING", "bucket_name": "inference-webhook-s3-worker-staging" }],
+   "queues": {
+     "producers": [{ "binding": "DELIVERIES", "queue": "inference-webhook-s3-worker-deliveries" }],
+     "consumers": [{
+       "queue": "inference-webhook-s3-worker-deliveries",
+       "max_batch_size": 10,
+       "max_batch_timeout": 1,
+       "max_retries": 20,
+       "dead_letter_queue": "inference-webhook-s3-worker-deliveries-dlq"
+     }]
+   },
+   "triggers": { "crons": ["* * * * *"] }
+   ```
+
+3. Run `npx wrangler deploy`. Secrets stay as they are.
+
+</details>
+
+### Bindings
+
+Buffered mode adds no settings. It is on when both bindings exist:
+
+| Binding | Type | Use |
+| --- | --- | --- |
+| `STAGING` | R2 bucket | Holds each accepted delivery until S3 has it. Use a bucket for this Worker only. |
+| `DELIVERIES` | Queue producer, and the same queue as consumer | One small message per delivery: its key. |
+
+With only one of the two, the Worker answers `500` and `status` names the missing one. With neither, it runs in direct mode.
+
+### What happens when something fails
+
+| Failure | What happens |
+| --- | --- |
+| R2 or the queue rejects a delivery | `503`. inference.net retries it, as in direct mode. |
+| S3 rejects a copy or does not answer | The message is retried after 30 s, then twice as long each time up to 1 hour: 20 attempts in about 14 hours. The staged copy stays in R2. |
+| A message is lost, or all 20 attempts fail | The message goes to the dead letter queue. Every minute a sweep finds staged objects older than 15 minutes and queues them again. The sweep first copies one of them itself, and queues the rest only when that copy works, so an S3 outage does not pile up messages. |
+| The Worker crashes or is redeployed while it copies | The message was not acknowledged, so the queue delivers it again. |
+| inference.net or the queue sends a delivery twice | The second copy overwrites the same key with the same body. |
+
+R2 keeps staged objects until they are copied, so a delivery waits in R2 for as long as S3 is down. The sweep lists at most 10,000 staged objects a minute.
+
+### Watch it
+
+`npm run cli -- status <name>` adds a buffer check. It fails when a delivery has waited for S3 for over 30 minutes:
+
+```text
+  ✔ Buffer empty: every accepted delivery is in S3
+```
+
+`npm run cli -- logs <name>` prints one JSON line per step:
+
+| `event` | When |
+| --- | --- |
+| `staged` | A delivery is in R2 and queued. Has `key` and `bytes`. |
+| `delivered` | A copy to S3 worked. Has `key`, `attempts` and `ms`. `result` is `already delivered` for a repeated message. |
+| `retry` | A copy failed. Has `attempts`, `delaySeconds` and `error`. |
+| `sweep` | Once a minute: `staged`, `oldestStagedAt`, `stale` (older than 15 minutes) and `requeued`. With `stale` above 0, the sweep copied one stale delivery itself; `error` says why that copy failed. |
+
+The Queues page of the Cloudflare dashboard shows the backlog of `<name>-deliveries` and `<name>-deliveries-dlq`. A message in the dead letter queue needs no action: its staged object stays in R2, and the sweep queues it again once S3 works.
+
+### Turn it off
+
+Wait until `status` shows the buffer empty. Then remove the bindings (for a CLI Worker, delete the `buffer` field from `.webhook-s3/<name>.json`) and run `update`. Staged objects that are left in R2 when the bindings go are not copied.
+
+### Cost
+
+On top of direct mode, per million deliveries: R2 writes about $4.50, R2 reads about $1.08 (the consumer reads each delivery twice: once to find failed requests, so the marker goes first, then to copy it), and queue operations about $1.20. That is about $7 per million deliveries, or about $14 for the billion embeddings in [Cost](#reference). R2 storage costs almost nothing, because objects stay only until they are copied.
+
 ## Reference
 
 <details>
