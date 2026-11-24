@@ -374,6 +374,7 @@ Grace window: a group that finished less than `--grace-hours` ago (default 24) c
 Notes:
 
 - The rebuilt object matches the webhook body byte for byte, except for `timestamp`. The webhook sends the time the group was finalized. A rebuilt object has the listing's `completed_at`, or else the latest `finishedAt` of its generations (a few hundred milliseconds earlier). Rebuilt objects carry the S3 metadata `x-amz-meta-reconciled: true`.
+- Speed: from a machine outside AWS (about 60 ms from the bucket), a dry run checked 1,001,000 groups at 717/s with `--concurrency 64`, 2,168/s with 256, and 3,377/s with 512. At 512, 32 million groups take about 2.6 hours and cost about $12.80 in S3 GET requests. Run it in the bucket's region to go faster.
 - It is safe to rerun. A repair writes the key that a delivery would write, and a late delivery overwrites it with the same content.
 - With `--checkpoint progress.json`, it saves its position after each chunk of groups. Rerun the same command to resume. The file is deleted when the run finishes.
 - `--dry-run` only counts. With `--from-log`, a dry run also counts a group that is still running, or inside the grace window, as missing.
