@@ -336,7 +336,7 @@ Wait until `status` shows the buffer empty. Then remove the bindings (for a CLI 
 
 ### Cost
 
-On top of direct mode, per million deliveries: R2 writes about $4.50, R2 reads about $0.72, queue operations about $1.20. That is about $6.50 per million deliveries, or about $13 for the billion embeddings in [Cost](#reference). R2 storage costs almost nothing, because objects stay only until they are copied.
+On top of direct mode, per million deliveries: R2 writes about $4.50, R2 reads about $1.08 (the consumer reads each delivery twice: once to find failed requests, so the marker goes first, then to copy it), and queue operations about $1.20. That is about $7 per million deliveries, or about $14 for the billion embeddings in [Cost](#reference). R2 storage costs almost nothing, because objects stay only until they are copied.
 
 ## Reference
 

@@ -28,7 +28,7 @@ export interface Env {
 
 /** The subset of an R2 bucket binding this Worker uses. */
 export interface StagingBucket {
-  put(key: string, value: ArrayBuffer, options: { customMetadata: Record<string, string> }): Promise<unknown>;
+  put(key: string, value: ReadableStream | ArrayBuffer | null): Promise<unknown>;
   get(key: string): Promise<StagedObject | null>;
   head(key: string): Promise<{ etag: string } | null>;
   delete(key: string): Promise<void>;
@@ -43,7 +43,6 @@ export interface StagedObject {
   etag: string;
   body: ReadableStream;
   checksums: { md5?: ArrayBuffer };
-  customMetadata?: Record<string, string>;
 }
 
 /** A queue message: the staged object's key, which is also its S3 key. */
@@ -251,21 +250,24 @@ async function handleDelivery(request: Request, env: Env, ctx: WorkerContext): P
     return fail(env, ctx, request, 400, "Unsupported event or missing id header");
   }
 
-  const body = await request.arrayBuffer();
-  const marker = hasFailure(body) ? `${prefix}failures/${key}` : null;
   if (env.STAGING && env.DELIVERIES) {
+    // Streams the body into R2, so even an 11 MB delivery takes almost no memory. R2 needs the length
+    // up front, so a body without Content-Length is read into memory first.
+    const contentLength = request.headers.get("content-length");
+    const body = contentLength ? request.body : await request.arrayBuffer();
     // The 200 below stops inference.net's retries, so answer it only after R2 and the queue both have the delivery.
     try {
-      await env.STAGING.put(`${prefix}${key}`, body, { customMetadata: marker ? { marker } : {} });
+      await env.STAGING.put(`${prefix}${key}`, body);
       await env.DELIVERIES.send({ key: `${prefix}${key}` });
     } catch (error) {
       return fail(env, ctx, request, 503, `Could not stage the delivery: ${String(error)}`);
     }
-    log("log", { event: "staged", key: `${prefix}${key}`, bytes: body.byteLength });
+    log("log", { event: "staged", key: `${prefix}${key}`, bytes: Number(contentLength ?? 0) });
   } else {
+    const body = await request.arrayBuffer();
     // Written before the result, so a saved result with a failed request always has its marker.
-    if (marker) {
-      const markerResult = await putObject(env, marker, "{}");
+    if (await hasFailure(body)) {
+      const markerResult = await putObject(env, `${prefix}failures/${key}`, "{}");
       if (!markerResult.ok) {
         return fail(env, ctx, request, 502, markerResult.message);
       }
@@ -319,9 +321,10 @@ async function workerStatus(env: Env, probe: boolean): Promise<WorkerStatus> {
 }
 
 /**
- * Copies one staged delivery to S3 (its failure marker first), then deletes it from R2. Never throws.
- * A missing object was already delivered, so it counts as success. S3 checks the body against the MD5
- * that R2 computed when the delivery was staged.
+ * Copies one staged delivery to S3, then deletes it from R2. Never throws. A missing object was already
+ * delivered, so it counts as success. It reads the staged object twice: first to find failed requests,
+ * so the failure marker reaches S3 before the result, as in direct mode, then to copy it. S3 checks the
+ * copy against the MD5 that R2 computed when the delivery was staged.
  */
 export async function deliverStaged(env: Env, key: string): Promise<{ ok: boolean; message: string }> {
   const staging = env.STAGING;
@@ -329,15 +332,17 @@ export async function deliverStaged(env: Env, key: string): Promise<{ ok: boolea
     return { ok: false, message: "STAGING is not bound" };
   }
   try {
-    const staged = await staging.get(key);
+    const scanned = await staging.get(key);
+    if (scanned && (await hasFailure(scanned.body))) {
+      // The staged key ends in <folder>/<id>.json; the marker goes under failures/ at the same prefix.
+      const marker = await putObject(env, key.replace(/[^/]+\/[^/]+$/, "failures/$&"), "{}");
+      if (!marker.ok) {
+        return marker;
+      }
+    }
+    const staged = scanned && (await staging.get(key));
     if (!staged) {
       return { ok: true, message: "already delivered" };
-    }
-    const marker = staged.customMetadata?.marker;
-    const markerResult = marker ? await putObject(env, marker, "{}") : null;
-    if (markerResult && !markerResult.ok) {
-      await staged.body.cancel();
-      return markerResult;
     }
     const md5 = staged.checksums.md5;
     const result = await putObject(env, key, staged.body, md5 ? { "Content-MD5": base64(md5) } : {});
@@ -441,22 +446,28 @@ export function objectKey(headers: Headers): string | null {
 // which only costs a reader one extra GET.
 const FAILURE = /"state"\s*:\s*"(?!Success")|"status"\s*:\s*"failed"/;
 
-// hasFailure decodes 1 MB at a time, so a large delivery is not held twice in memory, once as bytes and
-// once as text. Slices overlap by 1 KB, so a match is never cut in two.
-const SCAN_SLICE = 1 << 20;
-const SCAN_OVERLAP = 1 << 10;
+// hasFailure keeps the last 1 KB of text from one chunk to the next, so a match is never cut in two.
+const SCAN_OVERLAP = 1024;
 
 /**
  * True when a delivery holds a request that did not succeed. The Worker then
  * also writes `failures/<key>`, so a reader finds those results by listing
- * keys. Scans the text instead of parsing it, which keeps CPU per delivery low.
+ * keys. Scans the text a chunk at a time instead of parsing it, which keeps
+ * CPU and memory per delivery low.
  */
-export function hasFailure(body: ArrayBuffer): boolean {
+export async function hasFailure(body: ArrayBuffer | ReadableStream<Uint8Array>): Promise<boolean> {
+  const reader = (body instanceof ReadableStream ? body : (new Response(body).body as ReadableStream<Uint8Array>)).getReader();
   const decoder = new TextDecoder();
-  for (let start = 0; ; start += SCAN_SLICE - SCAN_OVERLAP) {
-    const end = Math.min(start + SCAN_SLICE, body.byteLength);
-    if (FAILURE.test(decoder.decode(new Uint8Array(body, start, end - start)))) return true;
-    if (end === body.byteLength) return false;
+  let carry = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    const text = carry + decoder.decode(value, { stream: !done });
+    if (FAILURE.test(text)) {
+      await reader.cancel();
+      return true;
+    }
+    if (done) return false;
+    carry = text.slice(-SCAN_OVERLAP);
   }
 }
 

@@ -134,21 +134,25 @@ describe("hasFailure", () => {
     ["a failed generation event", { event: "async-embedding.completed", data: generation("Failed") }, true],
     ["a successful generation event", { event: "async-embedding.completed", data: generation("Success") }, false],
     ["the words inside a string value", group("completed", generation("Success", { note: '"state":"Failed"' })), false],
-  ])("%s -> %s", (_, payload, expected) => {
-    expect(hasFailure(encode(payload))).toBe(expected);
+  ])("%s -> %s", async (_, payload, expected) => {
+    expect(await hasFailure(encode(payload))).toBe(expected);
   });
 
-  it("finds a failure that straddles two 1 MB scan slices, or sits at the end of a large body", () => {
-    const padding = "x".repeat((1 << 20) - 10);
-    const straddling = new TextEncoder().encode(`{"pad":"${padding}","state":"Failed"}`).buffer;
-    const atEnd = new TextEncoder().encode(`{"pad":"${padding.repeat(3)}","status":"failed"}`).buffer;
-    const clean = new TextEncoder().encode(`{"pad":"${padding.repeat(3)}","state":"Success"}`).buffer;
-    expect([straddling, atEnd, clean].map(hasFailure)).toEqual([true, true, false]);
+  it("finds a failure split across stream chunks", async () => {
+    const chunks = ['{"pad":"xx","sta', 'te"  :', ' "Fail', 'ed"}'].map((chunk) => new TextEncoder().encode(chunk));
+    const stream = new ReadableStream({
+      pull(controller) {
+        const chunk = chunks.shift();
+        if (chunk) controller.enqueue(chunk);
+        else controller.close();
+      },
+    });
+    expect(await hasFailure(stream)).toBe(true);
   });
 
-  it("allows whitespace around the colon", () => {
+  it("allows whitespace around the colon", async () => {
     const text = new TextEncoder().encode(JSON.stringify(group("completed", generation("Failed")), null, 2)).buffer;
-    expect(hasFailure(text)).toBe(true);
+    expect(await hasFailure(text)).toBe(true);
   });
 });
 
@@ -341,12 +345,13 @@ describe("status route", () => {
 
 describe("buffered mode", () => {
   function r2() {
-    const objects = new Map<string, { bytes: Uint8Array<ArrayBuffer>; uploaded: Date; etag: string; customMetadata: Record<string, string> }>();
+    const objects = new Map<string, { bytes: Uint8Array<ArrayBuffer>; uploaded: Date; etag: string }>();
     let version = 0;
     const bucket = {
       objects,
-      put: vi.fn(async (key: string, value: ArrayBuffer, options: { customMetadata: Record<string, string> }) => {
-        objects.set(key, { bytes: new Uint8Array(value), uploaded: new Date(), etag: `etag-${++version}`, ...options });
+      put: vi.fn(async (key: string, value: ReadableStream | ArrayBuffer | null) => {
+        const bytes = new Uint8Array(await new Response(value).arrayBuffer());
+        objects.set(key, { bytes, uploaded: new Date(), etag: `etag-${++version}` });
       }),
       get: vi.fn(async (key: string) => {
         const object = objects.get(key);
@@ -356,7 +361,6 @@ describe("buffered mode", () => {
           etag: object.etag,
           body: new Response(object.bytes).body as ReadableStream,
           checksums: { md5: md5.buffer.slice(md5.byteOffset, md5.byteOffset + md5.byteLength) },
-          customMetadata: object.customMetadata,
         };
       }),
       head: vi.fn(async (key: string) => objects.get(key) ?? null),
@@ -400,18 +404,15 @@ describe("buffered mode", () => {
     expect(response.status).toBe(200);
     expect(await response.text()).toBe("embeddings/groups/grp_123.json");
     expect(new TextDecoder().decode(staging.objects.get("embeddings/groups/grp_123.json")?.bytes)).toBe(groupBody);
-    expect(staging.objects.get("embeddings/groups/grp_123.json")?.customMetadata).toEqual({});
     expect(deliveries.send).toHaveBeenCalledWith({ key: "embeddings/groups/grp_123.json" });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("records the failure marker key on a staged delivery with a failed request", async () => {
+  it("streams a body with Content-Length into R2 instead of reading it into memory", async () => {
     const { staging, env: bufferedEnv } = buffered();
-    const body = JSON.stringify({ event: "slow-group.completed", data: { status: "failed", generations: [] } });
-    await worker.fetch(delivery({ body }), bufferedEnv, ctx);
-    expect(staging.objects.get("embeddings/groups/grp_123.json")?.customMetadata).toEqual({
-      marker: "embeddings/failures/groups/grp_123.json",
-    });
+    const response = await worker.fetch(delivery({ headers: { "Content-Length": String(groupBody.length) } }), bufferedEnv, ctx);
+    expect(response.status).toBe(200);
+    expect(staging.put.mock.calls[0]?.[1]).toBeInstanceOf(ReadableStream);
   });
 
   it.each(["put", "send"] as const)("returns 503 when the R2 %s fails, so inference.net retries", async (step) => {
