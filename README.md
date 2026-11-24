@@ -338,6 +338,47 @@ Wait until `status` shows the buffer empty. Then remove the bindings (for a CLI 
 
 On top of direct mode, per million deliveries: R2 writes about $4.50, R2 reads about $1.08 (the consumer reads each delivery twice: once to find failed requests, so the marker goes first, then to copy it), and queue operations about $1.20. That is about $7 per million deliveries, or about $14 for the billion embeddings in [Cost](#reference). R2 storage costs almost nothing, because objects stay only until they are copied.
 
+## Reconcile missing results
+
+inference.net retries a failed delivery for about 68 hours, then gives up. After a longer outage or a misconfiguration, some results are not in S3. `reconcile` finds every finished group whose `groups/<groupId>.json` is missing and writes it: the same key, and the same JSON as the webhook body. It works the same for every way the Worker saves results, because they all write the same keys.
+
+```sh
+export INFERENCE_API_KEY=... AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+
+# Every group your team created in a time range (complete)
+npm run reconcile -- --since 2026-11-01 --until 2026-11-08 --bucket my-bucket --region us-east-1 --prefix embeddings/
+
+# Only the group ids in a file you wrote while submitting
+npm run reconcile -- --from-log submitted.jsonl --bucket my-bucket --region us-east-1 --prefix embeddings/
+```
+
+It prints a line for each missing or repaired group, then one JSON summary:
+
+```json
+{"checked":68,"present":34,"missing":34,"repaired":34,"pending":0,"failed":0,"dryRun":false,"seconds":12.7,"groupsPerSecond":5}
+```
+
+Where the group ids come from:
+
+- `--since <date> [--until <date>]` lists every group of the API key's team from `GET /v1/async/groups`. This is the complete option: it finds groups that your own records missed.
+- `--from-log <file>` reads group ids from a file: one per line, either a bare id or a JSON object with `groupId` (the format that the examples' `--log` writes). It covers only the groups in that file. A group that your submitter did not log, for example because it crashed after the POST, is not checked.
+
+How it works:
+
+1. For each group, a `HEAD` on `<prefix>groups/<groupId>.json` (`--concurrency`, default 64).
+2. For each missing group, `GET /v1/async/group/<groupId>/generations`, then a `PUT` of the webhook body built from it (`--repair-concurrency`, default 4). A group that is still running counts as `pending` and is left alone.
+3. As the Worker does, it writes the `failures/` marker first when a request in the group failed.
+
+Notes:
+
+- The rebuilt object matches the webhook body byte for byte, except for `timestamp`. The webhook sends the time the group was finalized. A rebuilt object has the listing's `completed_at`, or else the latest `finishedAt` of its generations (a few hundred milliseconds earlier). Rebuilt objects carry the S3 metadata `x-amz-meta-reconciled: true`.
+- It is safe to rerun. A repair writes the key that a delivery would write, and a late delivery overwrites it with the same content.
+- With `--checkpoint progress.json`, it saves its position after each chunk of groups. Rerun the same command to resume. The file is deleted when the run finishes.
+- `--dry-run` only counts. With `--from-log`, a dry run counts a group that is still running as missing.
+- The S3 key needs `s3:GetObject` and `s3:ListBucket` (without `ListBucket`, S3 answers `403` instead of `404` for a missing key), and `s3:PutObject` to repair.
+- Exit code `1` when any group failed or is still missing; `2` for a usage error.
+- Single generations (`generations/<id>.json`) are not covered: only groups.
+
 ## Reference
 
 <details>

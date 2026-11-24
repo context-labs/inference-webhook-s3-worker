@@ -114,7 +114,7 @@ const REQUIRED_SETTINGS = [
 
 // Characters that need no URL encoding, so the signed path is the key as written.
 export const SAFE_KEY_PREFIX = /^[A-Za-z0-9/_.-]*$/;
-const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
+export const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
 // inference.net retries 5xx itself, so keep S3 retries short: the whole
 // request must finish inside the platform's 30 second delivery timeout.
