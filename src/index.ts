@@ -303,7 +303,7 @@ async function workerStatus(env: Env, probe: boolean): Promise<WorkerStatus> {
   const probeResult = canProbe
     ? await putObject(env, probeKey, JSON.stringify({ probe: true, at: new Date().toISOString() }))
     : null;
-  const scan = env.STAGING ? await scanStaging(env.STAGING, 1, 0) : null;
+  const scan = env.STAGING ? await scanStaging(env.STAGING, SWEEP_PAGES, 0) : null;
   return {
     missingSettings: missing,
     bucket: env.S3_BUCKET || null,
